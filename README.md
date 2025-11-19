@@ -37,3 +37,6 @@ Target dataset for fault injection
 
 ### `–num_trials` (default: 500/1000)
 Number of bit flip experiments to perform per input sample
+
+
+See AD.pdf for more details.
