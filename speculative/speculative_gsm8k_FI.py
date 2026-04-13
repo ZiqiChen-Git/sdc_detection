@@ -4,6 +4,7 @@ import os
 import random
 import re
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -54,9 +55,12 @@ def perform_bit_flip_single(value: torch.Tensor, bit_position: int) -> torch.Ten
     return flipped.view(torch.bfloat16)
 
 
-def load_tiny_gsm8k(bundle_root: str, split: str = "test", num_samples: int = 100, seed: int = 42):
-    data_dir = os.path.join(bundle_root, "tinyGSM8k", "main")
-    split_file = os.path.join(data_dir, f"{split}-00000-of-00001.parquet")
+def load_local_parquet_split(
+    split_file: str,
+    split: str,
+    num_samples: int,
+    seed: int,
+):
     if not os.path.exists(split_file):
         raise FileNotFoundError(f"Could not find split file at {split_file}")
     dataset = load_dataset("parquet", data_files={split: split_file})[split]
@@ -67,24 +71,122 @@ def load_tiny_gsm8k(bundle_root: str, split: str = "test", num_samples: int = 10
     return dataset
 
 
-def format_prompt(tokenizer: AutoTokenizer, question: str) -> str:
+def load_tiny_gsm8k(bundle_root: str, split: str = "test", num_samples: int = 100, seed: int = 42):
+    data_dir = os.path.join(bundle_root, "tinyGSM8k", "main")
+    split_file = os.path.join(data_dir, f"{split}-00000-of-00001.parquet")
+    return load_local_parquet_split(split_file, split, num_samples, seed)
+
+
+def load_tiny_mmlu(bundle_root: str, split: str = "test", num_samples: int = 100, seed: int = 42):
+    data_dir = os.path.join(bundle_root, "tinyMMLU", "all")
+    split_file = os.path.join(data_dir, f"{split}-00000-of-00001.parquet")
+    return load_local_parquet_split(split_file, split, num_samples, seed)
+
+
+def load_task_dataset(task: str, bundle_root: str, num_samples: int, seed: int):
+    if task == "gsm8k":
+        return load_tiny_gsm8k(bundle_root, split="test", num_samples=num_samples, seed=seed)
+    if task == "mmlu":
+        return load_tiny_mmlu(bundle_root, split="test", num_samples=num_samples, seed=seed)
+    raise ValueError(f"Unsupported task: {task}")
+
+
+def default_split_for_task(task: str) -> str:
+    task_splits = {
+        "gsm8k": "test",
+        "mmlu": "test",
+    }
+    return task_splits[task]
+
+
+def slugify_model_name(model_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", model_id.strip("/")).strip("-")
+
+
+def build_run_name(args) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base_slug = slugify_model_name(args.base_model_id)
+    draft_slug = slugify_model_name(args.draft_model_id)
+    return (
+        f"specdec"
+        f"_task-{args.task}"
+        f"_split-{args.dataset_split}"
+        f"_arch-{args.model_type}"
+        f"_base-{base_slug}"
+        f"_draft-{draft_slug}"
+        f"_fault-{args.fault_mode}"
+        f"_samples-{args.num_samples}"
+        f"_trials-{args.num_trials}"
+        f"_dtype-{args.dtype}"
+        f"_{timestamp}"
+    )
+
+
+def format_prompt(tokenizer: AutoTokenizer, user_content: str) -> str:
     if hasattr(tokenizer, "apply_chat_template"):
         try:
             return tokenizer.apply_chat_template(
-                [{"role": "user", "content": question}],
+                [{"role": "user", "content": user_content}],
                 tokenize=False,
                 add_generation_prompt=True,
             )
         except Exception:
             pass
-    return f"Question: {question}\nAnswer:"
+    return f"{user_content}\nAnswer:"
 
 
-def build_prompt(example: Dict[str, Any], tokenizer: AutoTokenizer) -> Tuple[str, str]:
+def build_gsm8k_prompt(example: Dict[str, Any], tokenizer: AutoTokenizer) -> Tuple[str, str]:
     question = example["question"]
     answer = example["answer"]
-    prompt = format_prompt(tokenizer, question)
+    user_content = (
+        "Solve the following math problem. "
+        "Output only the final numerical answer.\n"
+        f"Question: {question}"
+    )
+    prompt = format_prompt(tokenizer, user_content)
     return prompt, answer
+
+
+def normalize_mmlu_answer(answer: Any) -> str:
+    if isinstance(answer, str):
+        candidate = answer.strip().upper()
+        if candidate in {"A", "B", "C", "D"}:
+            return candidate
+        if candidate.isdigit():
+            index = int(candidate)
+            if 0 <= index < 4:
+                return "ABCD"[index]
+    if isinstance(answer, (int, np.integer)):
+        index = int(answer)
+        if 0 <= index < 4:
+            return "ABCD"[index]
+    raise ValueError(f"Unsupported MMLU answer format: {answer!r}")
+
+
+def build_mmlu_prompt(example: Dict[str, Any], tokenizer: AutoTokenizer) -> Tuple[str, str]:
+    choices = example["choices"]
+    answer = normalize_mmlu_answer(example["answer"])
+    question = example["question"]
+    subject = example.get("subject", "unknown subject")
+    options = "\n".join(
+        f"{label}. {choice}" for label, choice in zip(["A", "B", "C", "D"], choices)
+    )
+    user_content = (
+        f"The following is a multiple-choice question about {subject}.\n"
+        f"Question: {question}\n"
+        f"{options}\n"
+        "Answer with only one letter: A, B, C, or D."
+    )
+    prompt = format_prompt(tokenizer, user_content)
+    return prompt, answer
+
+
+def build_prompt(task: str, example: Dict[str, Any], tokenizer: AutoTokenizer) -> Tuple[str, str]:
+    if task == "gsm8k":
+        return build_gsm8k_prompt(example, tokenizer)
+    if task == "mmlu":
+        return build_mmlu_prompt(example, tokenizer)
+    raise ValueError(f"Unsupported task: {task}")
 
 
 def extract_final_answer(text: str) -> str:
@@ -109,7 +211,22 @@ def extract_last_number(text: str) -> Optional[float]:
     return None
 
 
-def is_answer_correct(prediction: str, reference: str) -> bool:
+def extract_mmlu_choice(text: str) -> Optional[str]:
+    upper = text.upper()
+    patterns = [
+        r"ANSWER\s*[:\-]?\s*\(?([ABCD])\)?",
+        r"OPTION\s*([ABCD])",
+        r"CHOICE\s*([ABCD])",
+        r"\b([ABCD])\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, upper)
+        if match:
+            return match.group(1)
+    return None
+
+
+def is_gsm8k_correct(prediction: str, reference: str) -> bool:
     pred_number = extract_last_number(prediction)
     try:
         ref_number = float(reference)
@@ -118,6 +235,19 @@ def is_answer_correct(prediction: str, reference: str) -> bool:
     if pred_number is None or ref_number is None:
         return False
     return pred_number == ref_number
+
+
+def is_mmlu_correct(prediction: str, reference: str) -> bool:
+    predicted_choice = extract_mmlu_choice(prediction)
+    return predicted_choice == reference
+
+
+def is_answer_correct(task: str, prediction: str, reference: str) -> bool:
+    if task == "gsm8k":
+        return is_gsm8k_correct(prediction, reference)
+    if task == "mmlu":
+        return is_mmlu_correct(prediction, reference)
+    raise ValueError(f"Unsupported task: {task}")
 
 
 def download_model_from_modelscope(model_id: str, cache_dir: str, revision: Optional[str] = None) -> str:
@@ -501,8 +631,10 @@ def aggregate_metrics(metrics_list: List[Dict[str, Any]]) -> Dict[str, float]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Speculative decoding GSM8K fault injection.")
+    parser = argparse.ArgumentParser(description="Speculative decoding fault injection.")
     parser.add_argument("--bundle_root", type=str, default="data_bundle")
+    parser.add_argument("--task", type=str, default="gsm8k", choices=["gsm8k", "mmlu"])
+    parser.add_argument("--dataset_split", type=str, default=None)
     parser.add_argument("--num_samples", type=int, default=50)
     parser.add_argument("--fault_mode", type=str, default="weight", choices=["weight", "neuron", "single"])
     parser.add_argument("--num_trials", type=int, default=10)
@@ -522,15 +654,16 @@ def main():
     parser.add_argument("--baseline_runs", type=int, default=1)
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    traces_dir = os.path.join(args.output_dir, "traces")
-    os.makedirs(traces_dir, exist_ok=True)
+    if args.dataset_split is None:
+        args.dataset_split = default_split_for_task(args.task)
 
-    if args.cache_dir is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        repo_root = os.path.abspath(os.path.join(script_dir, ".."))
-        args.cache_dir = os.path.abspath(os.path.join(repo_root, "..", "modelscope_cache"))
-    os.makedirs(args.cache_dir, exist_ok=True)
+    if args.dataset_split != default_split_for_task(args.task):
+        raise ValueError(
+            f"Unsupported split '{args.dataset_split}' for task '{args.task}'. "
+            f"Supported split: {default_split_for_task(args.task)}"
+        )
+
+    os.makedirs(args.output_dir, exist_ok=True)
 
     if args.base_model_id is None:
         if args.model_type == "qwen":
@@ -543,9 +676,21 @@ def main():
         else:
             args.draft_model_id = "tiiuae/Falcon3-1B"
 
+    run_name = build_run_name(args)
+    run_output_dir = os.path.join(args.output_dir, run_name)
+    os.makedirs(run_output_dir, exist_ok=False)
+    traces_dir = os.path.join(run_output_dir, "traces")
+    os.makedirs(traces_dir, exist_ok=True)
+
+    if args.cache_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.abspath(os.path.join(script_dir, ".."))
+        args.cache_dir = os.path.abspath(os.path.join(repo_root, "..", "modelscope_cache"))
+    os.makedirs(args.cache_dir, exist_ok=True)
+
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
 
-    dataset = load_tiny_gsm8k(args.bundle_root, num_samples=args.num_samples)
+    dataset = load_task_dataset(args.task, args.bundle_root, num_samples=args.num_samples, seed=42)
     base_model, base_tokenizer = load_model_and_tokenizer(args.base_model_id, args.cache_dir, args.base_revision, dtype)
     draft_model, draft_tokenizer = load_model_and_tokenizer(args.draft_model_id, args.cache_dir, args.draft_revision, dtype)
 
@@ -560,15 +705,15 @@ def main():
         hidden_slice=args.hidden_slice,
     )
 
-    all_answers = open(os.path.join(args.output_dir, "all_answers.jsonl"), "w", encoding="utf-8")
-    baseline_answers_fp = open(os.path.join(args.output_dir, "baseline_answers.jsonl"), "w", encoding="utf-8")
-    diff_answers = open(os.path.join(args.output_dir, "different_answers.jsonl"), "w", encoding="utf-8")
+    all_answers = open(os.path.join(run_output_dir, "all_answers.jsonl"), "w", encoding="utf-8")
+    baseline_answers_fp = open(os.path.join(run_output_dir, "baseline_answers.jsonl"), "w", encoding="utf-8")
+    diff_answers = open(os.path.join(run_output_dir, "different_answers.jsonl"), "w", encoding="utf-8")
 
     baseline_predictions = {}
     baseline_metrics_all: List[Dict[str, Any]] = []
     baseline_runs_info: List[Dict[str, Any]] = []
     baseline_correct_first = 0
-    print("Running speculative decoding baseline...")
+    print(f"Running speculative decoding baseline for {args.task}...")
     for run_idx in range(args.baseline_runs):
         print(f"Baseline run {run_idx+1}/{args.baseline_runs}")
         run_trace_dir = os.path.join(traces_dir, f"baseline_run_{run_idx}")
@@ -576,15 +721,15 @@ def main():
         run_metrics: List[Dict[str, Any]] = []
         run_correct = 0
         for sample_idx in tqdm(range(len(dataset)), desc=f"Baseline run {run_idx}"):
-            prompt, answer = build_prompt(dataset[sample_idx], base_tokenizer)
-            reference = extract_final_answer(answer)
+            prompt, answer = build_prompt(args.task, dataset[sample_idx], base_tokenizer)
+            reference = extract_final_answer(answer) if args.task == "gsm8k" else answer
             input_ids = base_tokenizer.encode(prompt, return_tensors="pt").to(DEVICE)
             result = decoder.generate(
                 input_ids=input_ids,
                 max_new_tokens=args.max_new_tokens,
                 eos_token_id=base_tokenizer.eos_token_id,
             )
-            is_correct = is_answer_correct(result["text"], reference)
+            is_correct = is_answer_correct(args.task, result["text"], reference)
             if run_idx == 0:
                 baseline_predictions[sample_idx] = result["text"]
                 if is_correct:
@@ -599,6 +744,8 @@ def main():
                 "mode": "baseline",
                 "baseline_run": run_idx,
                 "sample_id": sample_idx,
+                "task": args.task,
+                "dataset_split": args.dataset_split,
                 "prompt": prompt,
                 "reference": reference,
                 "prediction": result["text"],
@@ -621,7 +768,7 @@ def main():
     baseline_summary = aggregate_metrics(baseline_metrics_all)
     print(f"Baseline speculative accuracy (run 0): {baseline_accuracy:.4f}")
 
-    print("Running fault injection trials...")
+    print(f"Running fault injection trials for {args.task}...")
     trial_summaries = []
     for trial in range(args.num_trials):
         layer_idx, module_name, target_module = select_module(base_model, args.model_type)
@@ -657,21 +804,23 @@ def main():
             if hook is not None:
                 hook.triggered = False
                 hook.metadata = {}
-            prompt, answer = build_prompt(dataset[sample_idx], base_tokenizer)
-            reference = extract_final_answer(answer)
+            prompt, answer = build_prompt(args.task, dataset[sample_idx], base_tokenizer)
+            reference = extract_final_answer(answer) if args.task == "gsm8k" else answer
             input_ids = base_tokenizer.encode(prompt, return_tensors="pt").to(DEVICE)
             result = decoder.generate(
                 input_ids=input_ids,
                 max_new_tokens=args.max_new_tokens,
                 eos_token_id=base_tokenizer.eos_token_id,
             )
-            is_correct = is_answer_correct(result["text"], reference)
+            is_correct = is_answer_correct(args.task, result["text"], reference)
             trace_path = os.path.join(traces_dir, f"trial{trial}_sample_{sample_idx}.json")
             with open(trace_path, "w", encoding="utf-8") as trace_fp:
                 json.dump(result, trace_fp, ensure_ascii=False, indent=2)
             payload = {
                 **trial_desc,
                 "sample_id": sample_idx,
+                "task": args.task,
+                "dataset_split": args.dataset_split,
                 "reference": reference,
                 "prediction": result["text"],
                 "baseline_prediction": baseline_predictions[sample_idx],
@@ -706,10 +855,40 @@ def main():
     all_answers.close()
     baseline_answers_fp.close()
     diff_answers.close()
-    summary_path = os.path.join(args.output_dir, "speculative_metrics_summary.json")
+    metadata_path = os.path.join(run_output_dir, "run_metadata.json")
+    with open(metadata_path, "w", encoding="utf-8") as metadata_fp:
+        json.dump(
+            {
+                "run_name": run_name,
+                "run_output_dir": run_output_dir,
+                "task": args.task,
+                "dataset_split": args.dataset_split,
+                "num_samples": args.num_samples,
+                "num_trials": args.num_trials,
+                "fault_mode": args.fault_mode,
+                "model_type": args.model_type,
+                "base_model_id": args.base_model_id,
+                "draft_model_id": args.draft_model_id,
+                "dtype": args.dtype,
+                "bundle_root": args.bundle_root,
+                "cache_dir": args.cache_dir,
+            },
+            metadata_fp,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    summary_path = os.path.join(run_output_dir, "speculative_metrics_summary.json")
     with open(summary_path, "w", encoding="utf-8") as summary_fp:
         json.dump(
             {
+                "run_name": run_name,
+                "run_output_dir": run_output_dir,
+                "task": args.task,
+                "dataset_split": args.dataset_split,
+                "model_type": args.model_type,
+                "base_model_id": args.base_model_id,
+                "draft_model_id": args.draft_model_id,
                 "baseline_accuracy": baseline_accuracy,
                 "baseline_runs": baseline_runs_info,
                 "baseline_metric_summary": baseline_summary,
@@ -719,7 +898,7 @@ def main():
             ensure_ascii=False,
             indent=2,
         )
-    print(f"Results saved to {args.output_dir}")
+    print(f"Results saved to {run_output_dir}")
 
 
 if __name__ == "__main__":
