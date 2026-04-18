@@ -5,7 +5,7 @@ import random
 import re
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -107,6 +107,11 @@ def build_run_name(args) -> str:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     base_slug = slugify_model_name(args.base_model_id)
     draft_slug = slugify_model_name(args.draft_model_id)
+    sample_mode = "greedy" if (not args.do_sample or args.temperature <= 0) else f"t{args.temperature}"
+    if args.top_p is not None and args.do_sample:
+        sample_mode += f"_p{args.top_p}"
+    if args.top_k is not None and args.do_sample:
+        sample_mode += f"_k{args.top_k}"
     return (
         f"specdec"
         f"_task-{args.task}"
@@ -118,6 +123,7 @@ def build_run_name(args) -> str:
         f"_samples-{args.num_samples}"
         f"_trials-{args.num_trials}"
         f"_dtype-{args.dtype}"
+        f"_mode-{sample_mode}"
         f"_{timestamp}"
     )
 
@@ -275,24 +281,51 @@ def sample_from_logits(
     logits: torch.Tensor,
     temperature: float,
     top_k: Optional[int],
+    top_p: Optional[float] = None,
+    do_sample: bool = True,
 ) -> Tuple[int, float, List[Dict[str, Any]]]:
-    if temperature <= 0:
-        probs = torch.softmax(logits, dim=-1)
+    """
+    Returns (token_id, prob, topk_info).
+    topk_info is always computed from raw (unscaled) probs for consistent analysis.
+    When do_sample=False or temperature<=0, uses strict argmax (greedy decoding).
+    """
+    raw_probs = torch.softmax(logits, dim=-1).to(torch.float32)
+
+    # Greedy decoding: argmax, deterministic
+    if not do_sample or temperature <= 0:
+        token_id = torch.argmax(logits, dim=-1).item()
+        prob = raw_probs[0, token_id].item()
     else:
-        probs = torch.softmax(logits / temperature, dim=-1)
-    probs = probs.to(torch.float32)
-    if top_k is not None and top_k < probs.shape[-1]:
-        topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
-        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
-        idx = torch.multinomial(topk_probs, num_samples=1)
-        token_id = topk_indices.gather(-1, idx).item()
-        prob = topk_probs.gather(-1, idx).item()
-    else:
-        idx = torch.multinomial(probs, num_samples=1)
-        token_id = idx.item()
-        prob = probs[0, token_id].item()
-    view_k = min(20, probs.shape[-1])
-    view_probs, view_idx = torch.topk(probs, view_k, dim=-1)
+        scaled_probs = torch.softmax(logits / temperature, dim=-1).to(torch.float32)
+
+        if top_k is not None and top_k < scaled_probs.shape[-1]:
+            topk_probs, topk_indices = torch.topk(scaled_probs, top_k, dim=-1)
+            if top_p is not None:
+                # Apply nucleus cutoff within top-k tokens
+                cumulative = torch.cumsum(topk_probs, dim=-1)
+                nucleus_mask = (cumulative - topk_probs) < top_p
+                topk_probs = topk_probs * nucleus_mask
+            topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+            idx = torch.multinomial(topk_probs, num_samples=1)
+            token_id = topk_indices.gather(-1, idx).item()
+            prob = topk_probs.gather(-1, idx).item()
+        elif top_p is not None:
+            # Pure nucleus sampling (no top-k limit)
+            sorted_probs, sorted_indices = torch.sort(scaled_probs, dim=-1, descending=True)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            nucleus_mask = (cumulative - sorted_probs) < top_p
+            sorted_probs = sorted_probs * nucleus_mask
+            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+            idx = torch.multinomial(sorted_probs, num_samples=1)
+            token_id = sorted_indices.gather(-1, idx).item()
+            prob = sorted_probs.gather(-1, idx).item()
+        else:
+            idx = torch.multinomial(scaled_probs, num_samples=1)
+            token_id = idx.item()
+            prob = scaled_probs[0, token_id].item()
+
+    view_k = min(20, raw_probs.shape[-1])
+    view_probs, view_idx = torch.topk(raw_probs, view_k, dim=-1)
     topk_info = [
         {"token_id": view_idx[0, i].item(), "prob": view_probs[0, i].item()}
         for i in range(view_k)
@@ -310,6 +343,8 @@ class SpeculativeDecoder:
         block_size: int = 4,
         temperature: float = 0.7,
         top_k: Optional[int] = 50,
+        top_p: Optional[float] = None,
+        do_sample: bool = True,
         hidden_slice: int = 32,
     ):
         self.base_model = base_model
@@ -319,7 +354,11 @@ class SpeculativeDecoder:
         self.block_size = block_size
         self.temperature = temperature
         self.top_k = top_k
+        self.top_p = top_p
+        self.do_sample = do_sample
         self.hidden_slice = hidden_slice
+        # Greedy mode when do_sample=False or temperature<=0
+        self._greedy = not do_sample or temperature <= 0
 
     @torch.no_grad()
     def _propose_with_draft(
@@ -330,14 +369,17 @@ class SpeculativeDecoder:
         proposals = []
         working_ids = context_ids.clone()
         forward_calls = 0
-        draft_time = 0.0
+        total_draft_time = 0.0
         for _ in range(self.block_size):
-            start = time.time()
+            t0 = time.time()
             outputs = self.draft_model(working_ids, use_cache=False, output_hidden_states=False)
-            draft_time += time.time() - start
+            step_time = time.time() - t0
+            total_draft_time += step_time
             forward_calls += 1
             logits = outputs.logits[:, -1, :]
-            token_id, token_prob, topk_info = sample_from_logits(logits, self.temperature, self.top_k)
+            token_id, token_prob, topk_info = sample_from_logits(
+                logits, self.temperature, self.top_k, self.top_p, self.do_sample
+            )
             token_tensor = torch.tensor([[token_id]], device=working_ids.device)
             proposals.append(
                 {
@@ -345,6 +387,7 @@ class SpeculativeDecoder:
                     "token_tensor": token_tensor,
                     "prob": token_prob,
                     "topk": topk_info,
+                    "draft_forward_time": step_time,
                 }
             )
             working_ids = torch.cat([working_ids, token_tensor], dim=1)
@@ -352,45 +395,50 @@ class SpeculativeDecoder:
                 break
         return {
             "proposals": proposals,
-            "draft_time": draft_time,
+            "draft_time": total_draft_time,
             "forward_calls": forward_calls,
         }
 
     @torch.no_grad()
     def _forward_teacher(self, context_ids: torch.Tensor) -> Dict[str, Any]:
-        start = time.time()
+        t0 = time.time()
         outputs = self.base_model(
             context_ids,
             use_cache=False,
             output_hidden_states=True,
         )
-        elapsed = time.time() - start
+        elapsed = time.time() - t0
         logits = outputs.logits[:, -1, :]
-        if self.temperature <= 0:
-            probs = torch.softmax(logits, dim=-1)
-        else:
-            probs = torch.softmax(logits / self.temperature, dim=-1)
-        view_k = min(20, probs.shape[-1])
-        topk_probs, topk_idx = torch.topk(probs, view_k, dim=-1)
-        topk = []
-        for i in range(view_k):
-            token_id = topk_idx[0, i].item()
-            topk.append(
-                {
-                    "token_id": token_id,
-                    "prob": topk_probs[0, i].item(),
-                    "token": self.base_tokenizer.decode([token_id]),
-                }
-            )
-        sample_id, sample_prob, _ = sample_from_logits(logits, self.temperature, self.top_k)
+        # Raw probs (unscaled) — used for topk display and argmax
+        raw_probs = torch.softmax(logits, dim=-1).to(torch.float32)
+        # Argmax is temperature-independent
+        argmax_id = torch.argmax(logits, dim=-1).item()
+        argmax_prob = raw_probs[0, argmax_id].item()
+        # Top-20 from raw probs for consistent cross-experiment analysis
+        view_k = min(20, raw_probs.shape[-1])
+        topk_probs, topk_idx = torch.topk(raw_probs, view_k, dim=-1)
+        topk = [
+            {
+                "token_id": topk_idx[0, i].item(),
+                "prob": topk_probs[0, i].item(),
+                "token": self.base_tokenizer.decode([topk_idx[0, i].item()]),
+            }
+            for i in range(view_k)
+        ]
+        # sample_id: argmax in greedy mode, sampled otherwise
+        sample_id, sample_prob, _ = sample_from_logits(
+            logits, self.temperature, self.top_k, self.top_p, self.do_sample
+        )
         hidden_state = outputs.hidden_states[-1][0, -1, :].detach().float()
         return {
-            "probs": probs,
+            "raw_probs": raw_probs,
             "hidden_state": hidden_state,
             "topk": topk,
+            "argmax_id": argmax_id,
+            "argmax_prob": argmax_prob,
             "sample_id": sample_id,
             "sample_prob": sample_prob,
-            "time": elapsed,
+            "base_forward_time": elapsed,
         }
 
     @torch.no_grad()
@@ -399,7 +447,14 @@ class SpeculativeDecoder:
         input_ids: torch.Tensor,
         max_new_tokens: int = 200,
         eos_token_id: Optional[int] = None,
+        fault_probe: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
+        """
+        fault_probe: callable returning True if a fault is currently active.
+                     For weight-mode faults, pass `lambda: True`.
+                     For activation-mode faults, pass `lambda: hook.triggered`.
+                     If None, fault_active is not recorded (set to None).
+        """
         context_ids = input_ids.clone()
         generated_ids: List[int] = []
         trace: List[Dict[str, Any]] = []
@@ -415,7 +470,11 @@ class SpeculativeDecoder:
             "iteration_count": 0,
         }
         start_time = time.time()
+        step_counter = 0
+        iteration_idx = 0
+
         while len(generated_ids) < max_new_tokens:
+            iteration_idx += 1
             metrics["iteration_count"] += 1
             proposal_pack = self._propose_with_draft(context_ids, eos_token_id)
             proposals = proposal_pack["proposals"]
@@ -425,43 +484,74 @@ class SpeculativeDecoder:
                 break
             metrics["proposals_generated"] += len(proposals)
             accept_all = True
+
             for local_step, proposal in enumerate(proposals):
                 if len(generated_ids) >= max_new_tokens:
                     break
+
                 teacher_info = self._forward_teacher(context_ids)
                 metrics["base_forward_calls"] += 1
-                metrics["base_time"] += teacher_info["time"]
-                base_probs = teacher_info["probs"]
-                proposed_prob = base_probs[0, proposal["token_id"]].item()
-                acceptance_ratio = min(1.0, (proposed_prob + EPS) / (proposal["prob"] + EPS))
-                accepted = random.random() < acceptance_ratio
+                metrics["base_time"] += teacher_info["base_forward_time"]
+
+                base_raw_probs = teacher_info["raw_probs"]
+                # base_prob: raw probability of proposed token (for analysis & acceptance ratio)
+                proposed_base_prob = base_raw_probs[0, proposal["token_id"]].item()
+
+                # Determine acceptance
+                if self._greedy:
+                    # Greedy verification: accept iff base argmax == draft proposal
+                    accepted = teacher_info["argmax_id"] == proposal["token_id"]
+                    acceptance_ratio = 1.0 if accepted else 0.0
+                else:
+                    acceptance_ratio = min(1.0, (proposed_base_prob + EPS) / (proposal["prob"] + EPS))
+                    accepted = random.random() < acceptance_ratio
+
+                # Proposed token's rank in base top-20
+                base_topk_ids = [e["token_id"] for e in teacher_info["topk"]]
+                proposed_token_base_rank = (
+                    base_topk_ids.index(proposal["token_id"])
+                    if proposal["token_id"] in base_topk_ids
+                    else len(base_topk_ids)
+                )
+
                 hidden_slice = teacher_info["hidden_state"][: self.hidden_slice].tolist()
                 draft_decoded = self.draft_tokenizer.decode([proposal["token_id"]])
                 base_decoded = self.base_tokenizer.decode([proposal["token_id"]])
                 draft_topk = [
-                    {
-                        **entry,
-                        "token": self.draft_tokenizer.decode([entry["token_id"]]),
-                    }
+                    {**entry, "token": self.draft_tokenizer.decode([entry["token_id"]])}
                     for entry in proposal["topk"]
                 ]
+
+                fault_active = fault_probe() if fault_probe is not None else None
+
                 trace.append(
                     {
-                        "step": len(trace),
+                        "step": step_counter,
+                        "iteration_idx": iteration_idx,
+                        "local_step_in_block": local_step,
+                        "generated_index": len(generated_ids),
                         "source": "draft",
                         "draft_token_id": proposal["token_id"],
                         "draft_token": draft_decoded,
                         "base_vocab_token": base_decoded,
                         "draft_prob": proposal["prob"],
-                        "base_prob": proposed_prob,
+                        "draft_forward_time": proposal["draft_forward_time"],
+                        "base_argmax_id": teacher_info["argmax_id"],
+                        "base_argmax_prob": teacher_info["argmax_prob"],
+                        "base_prob": proposed_base_prob,
+                        "proposed_token_base_rank": proposed_token_base_rank,
                         "acceptance_ratio": acceptance_ratio,
                         "accepted": accepted,
+                        "base_forward_time": teacher_info["base_forward_time"],
+                        "fault_active": fault_active,
                         "base_topk": teacher_info["topk"],
                         "draft_topk": draft_topk,
                         "hidden_state_slice": hidden_slice,
                         "reason": "draft_token_verification",
                     }
                 )
+                step_counter += 1
+
                 if accepted:
                     metrics["accepted_proposals"] += 1
                     generated_ids.append(proposal["token_id"])
@@ -470,47 +560,69 @@ class SpeculativeDecoder:
                     accept_all = False
                     metrics["rejected_proposals"] += 1
                     metrics["base_only_tokens"] += 1
-                    base_token_tensor = torch.tensor([[teacher_info["sample_id"]]], device=context_ids.device)
-                    generated_ids.append(teacher_info["sample_id"])
+                    base_token_id = teacher_info["sample_id"]
+                    base_token_tensor = torch.tensor([[base_token_id]], device=context_ids.device)
+                    generated_ids.append(base_token_id)
                     context_ids = torch.cat([context_ids, base_token_tensor], dim=1)
                     trace.append(
                         {
-                            "step": len(trace),
+                            "step": step_counter,
+                            "iteration_idx": iteration_idx,
+                            "local_step_in_block": local_step,
+                            "generated_index": len(generated_ids) - 1,
                             "source": "base",
-                            "base_token_id": teacher_info["sample_id"],
-                            "base_token": self.base_tokenizer.decode([teacher_info["sample_id"]]),
+                            "base_token_id": base_token_id,
+                            "base_token": self.base_tokenizer.decode([base_token_id]),
+                            "base_argmax_id": teacher_info["argmax_id"],
+                            "base_argmax_prob": teacher_info["argmax_prob"],
                             "base_prob": teacher_info["sample_prob"],
+                            "base_forward_time": teacher_info["base_forward_time"],
+                            "fault_active": fault_active,
+                            "base_topk": teacher_info["topk"],
                             "hidden_state_slice": hidden_slice,
                             "reason": "base_resample_after_rejection",
-                            "base_topk": teacher_info["topk"],
                         }
                     )
+                    step_counter += 1
                     break
+
                 if eos_token_id is not None and proposal["token_id"] == eos_token_id:
                     accept_all = False
                     break
+
             if accept_all and len(generated_ids) < max_new_tokens:
                 teacher_info = self._forward_teacher(context_ids)
                 metrics["base_forward_calls"] += 1
-                metrics["base_time"] += teacher_info["time"]
+                metrics["base_time"] += teacher_info["base_forward_time"]
                 base_token_id = teacher_info["sample_id"]
                 base_token_tensor = torch.tensor([[base_token_id]], device=context_ids.device)
                 generated_ids.append(base_token_id)
                 context_ids = torch.cat([context_ids, base_token_tensor], dim=1)
+                fault_active = fault_probe() if fault_probe is not None else None
                 trace.append(
                     {
-                        "step": len(trace),
+                        "step": step_counter,
+                        "iteration_idx": iteration_idx,
+                        "local_step_in_block": len(proposals),
+                        "generated_index": len(generated_ids) - 1,
                         "source": "base",
                         "base_token_id": base_token_id,
                         "base_token": self.base_tokenizer.decode([base_token_id]),
+                        "base_argmax_id": teacher_info["argmax_id"],
+                        "base_argmax_prob": teacher_info["argmax_prob"],
                         "base_prob": teacher_info["sample_prob"],
+                        "base_forward_time": teacher_info["base_forward_time"],
+                        "fault_active": fault_active,
+                        "base_topk": teacher_info["topk"],
                         "hidden_state_slice": teacher_info["hidden_state"][: self.hidden_slice].tolist(),
                         "reason": "base_bridge_token",
-                        "base_topk": teacher_info["topk"],
                     }
                 )
+                step_counter += 1
+
             if eos_token_id is not None and generated_ids and generated_ids[-1] == eos_token_id:
                 break
+
         metrics["generation_time"] = time.time() - start_time
         metrics["acceptance_rate"] = (
             metrics["accepted_proposals"] / metrics["proposals_generated"]
@@ -524,6 +636,7 @@ class SpeculativeDecoder:
         )
         metrics["tokens_emitted"] = len(generated_ids)
         metrics["sdc_alert"] = metrics["rejected_proposals"] > 0
+
         if generated_ids:
             generated_tensor = torch.tensor(generated_ids, device=context_ids.device).unsqueeze(0)
             decoded = self.base_tokenizer.decode(generated_tensor[0], skip_special_tokens=True)
@@ -630,6 +743,25 @@ def aggregate_metrics(metrics_list: List[Dict[str, Any]]) -> Dict[str, float]:
     return summary
 
 
+def _build_decoding_config(args) -> Dict[str, Any]:
+    return {
+        "do_sample": args.do_sample,
+        "temperature": args.temperature,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+        "block_size": args.block_size,
+        "max_new_tokens": args.max_new_tokens,
+        "hidden_slice": args.hidden_slice,
+        "seed": args.seed,
+        "num_return_sequences": args.num_return_sequences,
+    }
+
+
+def _save_trace(result: Dict[str, Any], path: str) -> None:
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(result, fp, ensure_ascii=False, indent=2)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Speculative decoding fault injection.")
     parser.add_argument("--bundle_root", type=str, default="data_bundle")
@@ -642,6 +774,14 @@ def main():
     parser.add_argument("--block_size", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_k", type=int, default=50)
+    parser.add_argument("--top_p", type=float, default=None,
+                        help="Nucleus sampling probability threshold. Only used when --do_sample is set.")
+    parser.add_argument("--do_sample", action="store_true", default=False,
+                        help="Use sampling (temperature>0). If not set, uses greedy decoding.")
+    parser.add_argument("--num_return_sequences", type=int, default=1,
+                        help="Number of independent generation sequences per sample (repeated sampling).")
+    parser.add_argument("--seed", type=int, default=196,
+                        help="Global random seed for reproducibility.")
     parser.add_argument("--hidden_slice", type=int, default=128)
     parser.add_argument("--base_model_id", type=str, default=None)
     parser.add_argument("--draft_model_id", type=str, default=None)
@@ -653,6 +793,9 @@ def main():
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--baseline_runs", type=int, default=1)
     args = parser.parse_args()
+
+    # Re-seed with user-specified seed (module-level call used default 196)
+    seed_everything(args.seed)
 
     if args.dataset_split is None:
         args.dataset_split = default_split_for_task(args.task)
@@ -689,8 +832,9 @@ def main():
     os.makedirs(args.cache_dir, exist_ok=True)
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    decoding_config = _build_decoding_config(args)
 
-    dataset = load_task_dataset(args.task, args.bundle_root, num_samples=args.num_samples, seed=42)
+    dataset = load_task_dataset(args.task, args.bundle_root, num_samples=args.num_samples, seed=args.seed)
     base_model, base_tokenizer = load_model_and_tokenizer(args.base_model_id, args.cache_dir, args.base_revision, dtype)
     draft_model, draft_tokenizer = load_model_and_tokenizer(args.draft_model_id, args.cache_dir, args.draft_revision, dtype)
 
@@ -702,6 +846,8 @@ def main():
         block_size=args.block_size,
         temperature=args.temperature,
         top_k=args.top_k,
+        top_p=args.top_p,
+        do_sample=args.do_sample,
         hidden_slice=args.hidden_slice,
     )
 
@@ -709,10 +855,12 @@ def main():
     baseline_answers_fp = open(os.path.join(run_output_dir, "baseline_answers.jsonl"), "w", encoding="utf-8")
     diff_answers = open(os.path.join(run_output_dir, "different_answers.jsonl"), "w", encoding="utf-8")
 
-    baseline_predictions = {}
+    # key: (sample_idx, seq_idx) -> text; supports num_return_sequences > 1
+    baseline_predictions: Dict[Tuple[int, int], str] = {}
     baseline_metrics_all: List[Dict[str, Any]] = []
     baseline_runs_info: List[Dict[str, Any]] = []
     baseline_correct_first = 0
+
     print(f"Running speculative decoding baseline for {args.task}...")
     for run_idx in range(args.baseline_runs):
         print(f"Baseline run {run_idx+1}/{args.baseline_runs}")
@@ -720,46 +868,72 @@ def main():
         os.makedirs(run_trace_dir, exist_ok=True)
         run_metrics: List[Dict[str, Any]] = []
         run_correct = 0
+
         for sample_idx in tqdm(range(len(dataset)), desc=f"Baseline run {run_idx}"):
             prompt, answer = build_prompt(args.task, dataset[sample_idx], base_tokenizer)
             reference = extract_final_answer(answer) if args.task == "gsm8k" else answer
             input_ids = base_tokenizer.encode(prompt, return_tensors="pt").to(DEVICE)
-            result = decoder.generate(
-                input_ids=input_ids,
-                max_new_tokens=args.max_new_tokens,
-                eos_token_id=base_tokenizer.eos_token_id,
-            )
-            is_correct = is_answer_correct(args.task, result["text"], reference)
-            if run_idx == 0:
-                baseline_predictions[sample_idx] = result["text"]
+
+            sample_any_correct = False
+            for seq_idx in range(args.num_return_sequences):
+                result = decoder.generate(
+                    input_ids=input_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    eos_token_id=base_tokenizer.eos_token_id,
+                    fault_probe=lambda: True,  # baseline: weight mode always active (no fault injected)
+                )
+                # Inject self-contained metadata before saving
+                result["sample_meta"] = {
+                    "sample_id": sample_idx,
+                    "seq_idx": seq_idx,
+                    "run_idx": run_idx,
+                    "mode": "baseline",
+                    "prompt": prompt,
+                    "reference": reference,
+                    "prediction": result["text"],
+                    "is_correct": is_answer_correct(args.task, result["text"], reference),
+                }
+                result["decoding_config"] = decoding_config
+                result["fault_context"] = {"mode": "baseline", "fault_injected": False}
+
+                is_correct = result["sample_meta"]["is_correct"]
                 if is_correct:
-                    baseline_correct_first += 1
-            if is_correct:
-                run_correct += 1
-            run_metrics.append(result["metrics"])
-            trace_path = os.path.join(run_trace_dir, f"sample_{sample_idx}.json")
-            with open(trace_path, "w", encoding="utf-8") as trace_fp:
-                json.dump(result, trace_fp, ensure_ascii=False, indent=2)
-            baseline_payload = {
-                "mode": "baseline",
-                "baseline_run": run_idx,
-                "sample_id": sample_idx,
-                "task": args.task,
-                "dataset_split": args.dataset_split,
-                "prompt": prompt,
-                "reference": reference,
-                "prediction": result["text"],
-                "is_correct": is_correct,
-                "speculative_metrics": result["metrics"],
-                "trace_file": trace_path,
-            }
-            write_jsonl(baseline_answers_fp, baseline_payload)
-            write_jsonl(all_answers, baseline_payload)
+                    sample_any_correct = True
+                if run_idx == 0:
+                    baseline_predictions[(sample_idx, seq_idx)] = result["text"]
+                    if is_correct and seq_idx == 0:
+                        baseline_correct_first += 1
+
+                # Trace filename: baseline_run_{run}/sample_{i}_seq_{j}.json
+                seq_suffix = f"_seq{seq_idx}" if args.num_return_sequences > 1 else ""
+                trace_path = os.path.join(run_trace_dir, f"sample_{sample_idx}{seq_suffix}.json")
+                _save_trace(result, trace_path)
+
+                baseline_payload = {
+                    "mode": "baseline",
+                    "baseline_run": run_idx,
+                    "seq_idx": seq_idx,
+                    "sample_id": sample_idx,
+                    "task": args.task,
+                    "dataset_split": args.dataset_split,
+                    "prompt": prompt,
+                    "reference": reference,
+                    "prediction": result["text"],
+                    "is_correct": is_correct,
+                    "speculative_metrics": result["metrics"],
+                    "trace_file": trace_path,
+                }
+                write_jsonl(baseline_answers_fp, baseline_payload)
+                write_jsonl(all_answers, baseline_payload)
+                run_metrics.append(result["metrics"])
+                if is_correct:
+                    run_correct += 1
+
         baseline_metrics_all.extend(run_metrics)
         baseline_runs_info.append(
             {
                 "run": run_idx,
-                "accuracy": run_correct / len(dataset),
+                "accuracy": run_correct / (len(dataset) * args.num_return_sequences),
                 "metric_summary": aggregate_metrics(run_metrics),
             }
         )
@@ -776,6 +950,7 @@ def main():
         weight_snapshot = None
         hook_handle = None
         hook = None
+
         if args.fault_mode == "weight":
             weight_tensor = target_module.weight
             x = random.randint(0, weight_tensor.shape[0] - 1)
@@ -783,11 +958,21 @@ def main():
             weight_snapshot = (x, y, weight_tensor[x, y].clone())
             with torch.no_grad():
                 weight_tensor[x, y] = perform_bit_flip_double(weight_tensor[x, y], bit_positions)
+            fault_probe = lambda: True  # weight always active
         else:
             if args.fault_mode == "single":
                 bit_positions = random.randint(0, 15)
             hook = create_activation_hook(bit_positions, args.fault_mode)
             hook_handle = target_module.register_forward_hook(hook)
+            fault_probe = lambda: hook.triggered  # activation: True after first trigger
+
+        fault_context = {
+            "trial": trial,
+            "fault_mode": args.fault_mode,
+            "layer_idx": layer_idx,
+            "module": module_name,
+            "bit_positions": bit_positions if isinstance(bit_positions, list) else [bit_positions],
+        }
 
         trial_desc = {
             "trial": trial,
@@ -800,43 +985,72 @@ def main():
         trial_progress = tqdm(range(len(dataset)), desc=f"Trial {trial}")
         trial_metrics: List[Dict[str, Any]] = []
         trial_correct = 0
+
         for sample_idx in trial_progress:
-            if hook is not None:
-                hook.triggered = False
-                hook.metadata = {}
             prompt, answer = build_prompt(args.task, dataset[sample_idx], base_tokenizer)
             reference = extract_final_answer(answer) if args.task == "gsm8k" else answer
             input_ids = base_tokenizer.encode(prompt, return_tensors="pt").to(DEVICE)
-            result = decoder.generate(
-                input_ids=input_ids,
-                max_new_tokens=args.max_new_tokens,
-                eos_token_id=base_tokenizer.eos_token_id,
-            )
-            is_correct = is_answer_correct(args.task, result["text"], reference)
-            trace_path = os.path.join(traces_dir, f"trial{trial}_sample_{sample_idx}.json")
-            with open(trace_path, "w", encoding="utf-8") as trace_fp:
-                json.dump(result, trace_fp, ensure_ascii=False, indent=2)
-            payload = {
-                **trial_desc,
-                "sample_id": sample_idx,
-                "task": args.task,
-                "dataset_split": args.dataset_split,
-                "reference": reference,
-                "prediction": result["text"],
-                "baseline_prediction": baseline_predictions[sample_idx],
-                "is_correct": is_correct,
-                "speculative_metrics": result["metrics"],
-                "trace_file": trace_path,
-            }
-            if hook is not None and hook.metadata:
-                payload["activation_metadata"] = hook.metadata
-            write_jsonl(all_answers, payload)
-            if result["text"] != baseline_predictions[sample_idx]:
-                write_jsonl(diff_answers, payload)
-            safe_empty_cache()
-            trial_metrics.append(result["metrics"])
-            if is_correct:
-                trial_correct += 1
+
+            for seq_idx in range(args.num_return_sequences):
+                if hook is not None:
+                    hook.triggered = False
+                    hook.metadata = {}
+
+                result = decoder.generate(
+                    input_ids=input_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    eos_token_id=base_tokenizer.eos_token_id,
+                    fault_probe=fault_probe,
+                )
+                is_correct = is_answer_correct(args.task, result["text"], reference)
+
+                # Activation metadata captured after generate (hook may have fired)
+                trial_fault_context = {**fault_context}
+                if hook is not None and hook.metadata:
+                    trial_fault_context["activation_metadata"] = hook.metadata
+                    trial_fault_context["hook_triggered"] = hook.triggered
+
+                result["sample_meta"] = {
+                    "sample_id": sample_idx,
+                    "seq_idx": seq_idx,
+                    "trial": trial,
+                    "mode": "trial",
+                    "prompt": prompt,
+                    "reference": reference,
+                    "prediction": result["text"],
+                    "is_correct": is_correct,
+                }
+                result["decoding_config"] = decoding_config
+                result["fault_context"] = trial_fault_context
+
+                seq_suffix = f"_seq{seq_idx}" if args.num_return_sequences > 1 else ""
+                trace_path = os.path.join(traces_dir, f"trial{trial}_sample_{sample_idx}{seq_suffix}.json")
+                _save_trace(result, trace_path)
+
+                baseline_text = baseline_predictions.get((sample_idx, seq_idx), "")
+                payload = {
+                    **trial_desc,
+                    "seq_idx": seq_idx,
+                    "sample_id": sample_idx,
+                    "task": args.task,
+                    "dataset_split": args.dataset_split,
+                    "reference": reference,
+                    "prediction": result["text"],
+                    "baseline_prediction": baseline_text,
+                    "is_correct": is_correct,
+                    "speculative_metrics": result["metrics"],
+                    "trace_file": trace_path,
+                }
+                if hook is not None and hook.metadata:
+                    payload["activation_metadata"] = hook.metadata
+                write_jsonl(all_answers, payload)
+                if result["text"] != baseline_text:
+                    write_jsonl(diff_answers, payload)
+
+                safe_empty_cache()
+                trial_metrics.append(result["metrics"])
+                if is_correct:
+                    trial_correct += 1
 
         if args.fault_mode == "weight" and weight_snapshot is not None:
             with torch.no_grad():
@@ -844,10 +1058,11 @@ def main():
                 target_module.weight[x, y] = original_value
         if hook_handle is not None:
             hook_handle.remove()
+
         trial_summaries.append(
             {
                 **trial_desc,
-                "accuracy": trial_correct / len(dataset),
+                "accuracy": trial_correct / (len(dataset) * args.num_return_sequences),
                 "metric_summary": aggregate_metrics(trial_metrics),
             }
         )
@@ -855,6 +1070,7 @@ def main():
     all_answers.close()
     baseline_answers_fp.close()
     diff_answers.close()
+
     metadata_path = os.path.join(run_output_dir, "run_metadata.json")
     with open(metadata_path, "w", encoding="utf-8") as metadata_fp:
         json.dump(
@@ -872,6 +1088,7 @@ def main():
                 "dtype": args.dtype,
                 "bundle_root": args.bundle_root,
                 "cache_dir": args.cache_dir,
+                "decoding_config": decoding_config,
             },
             metadata_fp,
             ensure_ascii=False,
