@@ -1,0 +1,104 @@
+{
+  "run_name": "specdec_task-mmlu_split-test_arch-qwen_base-qwen-Qwen2.5-7B-Instruct_draft-qwen-Qwen2.5-1.5B-Instruct_fault-weight_samples-5_trials-2_dtype-bfloat16_20260414-075745",
+  "run_output_dir": "speculative_outputs/specdec_task-mmlu_split-test_arch-qwen_base-qwen-Qwen2.5-7B-Instruct_draft-qwen-Qwen2.5-1.5B-Instruct_fault-weight_samples-5_trials-2_dtype-bfloat16_20260414-075745",
+  "task": "mmlu",
+  "dataset_split": "test",
+  "model_type": "qwen",
+  "base_model_id": "qwen/Qwen2.5-7B-Instruct",
+  "draft_model_id": "qwen/Qwen2.5-1.5B-Instruct",
+  "baseline_accuracy": 0.8,
+  "baseline_runs": [
+    {
+      "run": 0,
+      "accuracy": 0.8,
+      "metric_summary": {
+        "proposals_generated": 2.2,
+        "accepted_proposals": 1.8,
+        "rejected_proposals": 0.2,
+        "base_only_tokens": 0.2,
+        "draft_forward_calls": 2.2,
+        "base_forward_calls": 2.0,
+        "draft_time": 0.13049516677856446,
+        "base_time": 0.028404855728149415,
+        "iteration_count": 1.0,
+        "generation_time": 0.22967677116394042,
+        "acceptance_rate": 0.8666666666666666,
+        "base_verification_ratio": 0.9333333333333333,
+        "tokens_emitted": 2.0,
+        "sdc_alert_rate": 0.2
+      }
+    }
+  ],
+  "baseline_metric_summary": {
+    "proposals_generated": 2.2,
+    "accepted_proposals": 1.8,
+    "rejected_proposals": 0.2,
+    "base_only_tokens": 0.2,
+    "draft_forward_calls": 2.2,
+    "base_forward_calls": 2.0,
+    "draft_time": 0.13049516677856446,
+    "base_time": 0.028404855728149415,
+    "iteration_count": 1.0,
+    "generation_time": 0.22967677116394042,
+    "acceptance_rate": 0.8666666666666666,
+    "base_verification_ratio": 0.9333333333333333,
+    "tokens_emitted": 2.0,
+    "sdc_alert_rate": 0.2
+  },
+  "trials": [
+    {
+      "trial": 0,
+      "fault_mode": "weight",
+      "layer_idx": 4,
+      "module": "mlp.gate_proj",
+      "bit_positions": [
+        3,
+        2
+      ],
+      "accuracy": 0.8,
+      "metric_summary": {
+        "proposals_generated": 2.4,
+        "accepted_proposals": 1.8,
+        "rejected_proposals": 0.2,
+        "base_only_tokens": 0.2,
+        "draft_forward_calls": 2.4,
+        "base_forward_calls": 2.0,
+        "draft_time": 0.032639265060424805,
+        "base_time": 0.027458047866821288,
+        "iteration_count": 1.0,
+        "generation_time": 0.10161428451538086,
+        "acceptance_rate": 0.85,
+        "base_verification_ratio": 0.9,
+        "tokens_emitted": 2.0,
+        "sdc_alert_rate": 0.2
+      }
+    },
+    {
+      "trial": 1,
+      "fault_mode": "weight",
+      "layer_idx": 22,
+      "module": "mlp.gate_proj",
+      "bit_positions": [
+        12,
+        11
+      ],
+      "accuracy": 0.8,
+      "metric_summary": {
+        "proposals_generated": 2.6,
+        "accepted_proposals": 1.6,
+        "rejected_proposals": 0.4,
+        "base_only_tokens": 0.4,
+        "draft_forward_calls": 2.6,
+        "base_forward_calls": 2.0,
+        "draft_time": 0.03499164581298828,
+        "base_time": 0.027850866317749023,
+        "iteration_count": 1.2,
+        "generation_time": 0.10483074188232422,
+        "acceptance_rate": 0.7166666666666667,
+        "base_verification_ratio": 0.8333333333333334,
+        "tokens_emitted": 2.0,
+        "sdc_alert_rate": 0.4
+      }
+    }
+  ]
+}
