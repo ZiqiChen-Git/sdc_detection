@@ -145,22 +145,42 @@ def sample_from_logits(
     logits: torch.Tensor,
     temperature: float,
     top_k: Optional[int],
+    do_sample: bool = True,
+    top_p: Optional[float] = None,
 ) -> Tuple[int, float, List[Dict[str, Any]]]:
-    if temperature <= 0:
-        probs = torch.softmax(logits, dim=-1)
-    else:
-        probs = torch.softmax(logits / temperature, dim=-1)
-    probs = probs.to(torch.float32)
-    if top_k is not None and top_k < probs.shape[-1]:
-        topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
-        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
-        idx = torch.multinomial(topk_probs, num_samples=1)
-        token_id = topk_indices.gather(-1, idx).item()
-        prob = topk_probs.gather(-1, idx).item()
-    else:
-        idx = torch.multinomial(probs, num_samples=1)
-        token_id = idx.item()
+    if not do_sample or temperature <= 0:
+        # Strict greedy decoding: always pick argmax, no randomness
+        probs = torch.softmax(logits, dim=-1).to(torch.float32)
+        token_id = logits.argmax(dim=-1).item()
         prob = probs[0, token_id].item()
+    else:
+        probs = torch.softmax(logits / temperature, dim=-1).to(torch.float32)
+        if top_k is not None and top_k < probs.shape[-1]:
+            topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
+            if top_p is not None:
+                sorted_probs, sort_order = torch.sort(topk_probs, descending=True, dim=-1)
+                cumulative = torch.cumsum(sorted_probs, dim=-1)
+                sorted_probs[cumulative - sorted_probs > top_p] = 0.0
+                sorted_probs /= sorted_probs.sum(dim=-1, keepdim=True)
+                topk_probs = sorted_probs.gather(-1, sort_order.argsort(dim=-1))
+            else:
+                topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+            idx = torch.multinomial(topk_probs, num_samples=1)
+            token_id = topk_indices.gather(-1, idx).item()
+            prob = topk_probs.gather(-1, idx).item()
+        else:
+            if top_p is not None:
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+                cumulative = torch.cumsum(sorted_probs, dim=-1)
+                sorted_probs[cumulative - sorted_probs > top_p] = 0.0
+                sorted_probs /= sorted_probs.sum(dim=-1, keepdim=True)
+                idx = torch.multinomial(sorted_probs, num_samples=1)
+                token_id = sorted_indices.gather(-1, idx).item()
+                prob = sorted_probs.gather(-1, idx).item()
+            else:
+                idx = torch.multinomial(probs, num_samples=1)
+                token_id = idx.item()
+                prob = probs[0, token_id].item()
     view_k = min(20, probs.shape[-1])
     view_probs, view_idx = torch.topk(probs, view_k, dim=-1)
     topk_info = [
@@ -180,6 +200,9 @@ class SpeculativeDecoder:
         block_size: int = 4,
         temperature: float = 0.7,
         top_k: Optional[int] = 50,
+        top_p: Optional[float] = None,
+        do_sample: bool = True,
+        num_return_sequences: int = 1,
         hidden_slice: int = 32,
     ):
         self.base_model = base_model
@@ -189,6 +212,9 @@ class SpeculativeDecoder:
         self.block_size = block_size
         self.temperature = temperature
         self.top_k = top_k
+        self.top_p = top_p
+        self.do_sample = do_sample
+        self.num_return_sequences = num_return_sequences
         self.hidden_slice = hidden_slice
 
     @torch.no_grad()
@@ -207,7 +233,7 @@ class SpeculativeDecoder:
             draft_time += time.time() - start
             forward_calls += 1
             logits = outputs.logits[:, -1, :]
-            token_id, token_prob, topk_info = sample_from_logits(logits, self.temperature, self.top_k)
+            token_id, token_prob, topk_info = sample_from_logits(logits, self.temperature, self.top_k, self.do_sample, self.top_p)
             token_tensor = torch.tensor([[token_id]], device=working_ids.device)
             proposals.append(
                 {
@@ -236,10 +262,11 @@ class SpeculativeDecoder:
         )
         elapsed = time.time() - start
         logits = outputs.logits[:, -1, :]
-        if self.temperature <= 0:
-            probs = torch.softmax(logits, dim=-1)
+        # probs must match the draft's probability space for a valid acceptance ratio
+        if not self.do_sample or self.temperature <= 0:
+            probs = torch.softmax(logits, dim=-1).to(torch.float32)
         else:
-            probs = torch.softmax(logits / self.temperature, dim=-1)
+            probs = torch.softmax(logits / self.temperature, dim=-1).to(torch.float32)
         view_k = min(20, probs.shape[-1])
         topk_probs, topk_idx = torch.topk(probs, view_k, dim=-1)
         topk = []
@@ -252,7 +279,7 @@ class SpeculativeDecoder:
                     "token": self.base_tokenizer.decode([token_id]),
                 }
             )
-        sample_id, sample_prob, _ = sample_from_logits(logits, self.temperature, self.top_k)
+        sample_id, sample_prob, _ = sample_from_logits(logits, self.temperature, self.top_k, self.do_sample, self.top_p)
         hidden_state = outputs.hidden_states[-1][0, -1, :].detach().float()
         return {
             "probs": probs,
@@ -510,6 +537,11 @@ def main():
     parser.add_argument("--block_size", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_k", type=int, default=50)
+    parser.add_argument("--top_p", type=float, default=None)
+    parser.add_argument("--do_sample", action="store_true", default=True)
+    parser.add_argument("--no_sample", dest="do_sample", action="store_false")
+    parser.add_argument("--num_return_sequences", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=196)
     parser.add_argument("--hidden_slice", type=int, default=128)
     parser.add_argument("--base_model_id", type=str, default=None)
     parser.add_argument("--draft_model_id", type=str, default=None)
@@ -521,6 +553,11 @@ def main():
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--baseline_runs", type=int, default=1)
     args = parser.parse_args()
+
+    seed_everything(args.seed)
+    # Force greedy when temperature=0 regardless of --do_sample flag
+    if args.temperature <= 0:
+        args.do_sample = False
 
     os.makedirs(args.output_dir, exist_ok=True)
     traces_dir = os.path.join(args.output_dir, "traces")
@@ -557,6 +594,9 @@ def main():
         block_size=args.block_size,
         temperature=args.temperature,
         top_k=args.top_k,
+        top_p=args.top_p,
+        do_sample=args.do_sample,
+        num_return_sequences=args.num_return_sequences,
         hidden_slice=args.hidden_slice,
     )
 
