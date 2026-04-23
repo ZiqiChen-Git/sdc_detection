@@ -65,6 +65,12 @@ try:
 except ImportError:
     _FAULT_INJECTION_AVAILABLE = False
 
+try:
+    from datasets_loader import load_dataset as load_benchmark, extract_answer, is_correct
+    _DATASETS_AVAILABLE = True
+except ImportError:
+    _DATASETS_AVAILABLE = False
+
 EPS = 1e-8
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TOP_K_RECORD = 5
@@ -764,16 +770,29 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_model_id",  default="Qwen/Qwen3-8B")
     parser.add_argument("--draft_model_id", default="RedHatAI/Qwen3-8B-Thinking-speculator.eagle3")
-    parser.add_argument("--prompt",         default="What is the capital of France?")
     parser.add_argument("--block_size",     type=int,   default=5)
     parser.add_argument("--max_new_tokens", type=int,   default=4096)
-    parser.add_argument("--temperature",    type=float, default=0.0)
-    parser.add_argument("--top_k",          type=int,   default=50)
+    parser.add_argument("--temperature",    type=float, default=0.6,
+                        help="Qwen3 thinking 모드 권장값: 0.6. 0으로 하면 반복 루프 위험.")
+    parser.add_argument("--top_k",          type=int,   default=20,
+                        help="Qwen3 thinking 모드 권장값: 20.")
+    parser.add_argument("--top_p",          type=float, default=0.95,
+                        help="Qwen3 thinking 모드 권장값: 0.95.")
+    parser.add_argument("--enable_thinking", action="store_true", default=True,
+                        help="Qwen3 thinking 모드 활성화. 기본 True.")
     parser.add_argument("--seed",           type=int,   default=42)
     parser.add_argument("--dtype",          default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--output_json",    default=None)
-    # ---- fault injection 参数 ----
-    # 不传 --fault_location 就是纯 baseline，不注入任何故障
+    # ---- 数据集 / 单题 ----
+    parser.add_argument("--dataset",        default=None,
+                        choices=["gsm8k", "math500", "aime2024", "aime2025",
+                                 "gpqa", "livecodebench", "openthoughts"],
+                        help="传入数据集名称则批量跑；不传则用 --prompt 单题模式。")
+    parser.add_argument("--num_samples",    type=int, default=None,
+                        help="每个数据集最多取多少题。None = 全部。")
+    parser.add_argument("--prompt",         default="What is 25 * 48?",
+                        help="单题模式下使用的问题（--dataset 不传时生效）。")
+    # ---- fault injection ----
     parser.add_argument("--fault_location", default=None,
                         choices=["target_layer", "target_embed",
                                  "draft_embed", "draft_fc", "draft_layer",
@@ -792,13 +811,17 @@ def main():
                         choices=["prefill", "verify", "both"],
                         help="activation fault 专用：限定在哪个阶段触发。")
     parser.add_argument("--fault_seed",     type=int, default=None,
-                        help="控制注入点随机性的 seed（选哪行哪列、哪个 bit）。"
-                             "不填则由 --seed 统一控制。"
-                             "传入固定值可在不同 trial 间复现完全相同的注入点。")
+                        help="控制注入点随机性的 seed。不填则由 --seed 统一控制。")
     args = parser.parse_args()
 
     seed_everything(args.seed)
+    # thinking 모드에서는 greedy 금지 — temperature > 0 이면 항상 sampling
     do_sample = args.temperature > 0
+    if args.enable_thinking and not do_sample:
+        print("[Warning] Qwen3 thinking 모드에서 greedy decoding은 권장하지 않습니다. "
+              "temperature=0.6 으로 자동 설정합니다.")
+        args.temperature = 0.6
+        do_sample = True
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
 
     print(f"Loading target : {args.base_model_id}")
@@ -817,14 +840,8 @@ def main():
         top_k=args.top_k, do_sample=do_sample,
     )
 
-    prompt_text = tokenizer.apply_chat_template(
-        [{"role": "user", "content": args.prompt}],
-        tokenize=False, add_generation_prompt=True,
-    )
-    input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(DEVICE)
-
     # ----------------------------------------------------------------
-    # Fault injection 准备
+    # Fault injection 准备（注入一次，整个实验期间保持）
     # ----------------------------------------------------------------
     injector = None
     weight_snapshot = None
@@ -833,17 +850,15 @@ def main():
 
     if args.fault_location is not None:
         if not _FAULT_INJECTION_AVAILABLE:
-            raise RuntimeError("fault_injection.py not found. 请把它放在同一目录下。")
+            raise RuntimeError("fault_injection.py not found.")
 
         injector = FaultInjector(target_model, draft_head)
         location = FaultLocation(args.fault_location)
         mode     = FaultMode(args.fault_mode)
 
         if args.fault_type == "weight":
-            # 权重故障：注入后一直存在，generate 结束后再还原
             weight_snapshot = injector.inject_weight_fault(
-                location=location,
-                mode=mode,
+                location=location, mode=mode,
                 layer_idx=args.fault_layer_idx,
                 module_path=args.fault_module,
                 seed=args.fault_seed,
@@ -852,16 +867,12 @@ def main():
             print(f"[Fault] Weight fault injected: {fault_log}")
 
         else:
-            # 激活故障：用 phase-aware hook，通过 decoder.register_fault_hook 注册
-            # 这样 phase_filter 才能生效（hook 需要访问 target_wrapped.current_phase）
             if location == FaultLocation.TARGET_LAYER:
                 layer_idx = args.fault_layer_idx
                 if layer_idx is None:
-                    # fault_seed 控制层的随机选择
                     rng = random.Random(args.fault_seed)
                     layer_idx = rng.randint(0, len(target_model.model.layers) - 1)
 
-                # fault_seed 控制 hook 内部的随机选择
                 _hook_rng = random.Random(args.fault_seed)
 
                 def _bit_flip_hook(module, inputs, output):
@@ -882,74 +893,115 @@ def main():
                     return (tensor,) + output[1:] if isinstance(output, tuple) else tensor
 
                 activation_handle = decoder.register_fault_hook(
-                    layer_idx=layer_idx,
-                    hook_fn=_bit_flip_hook,
+                    layer_idx=layer_idx, hook_fn=_bit_flip_hook,
                     phase_filter=args.fault_phase,
                 )
                 fault_log = {
-                    "location": location.value,
-                    "layer_idx": layer_idx,
-                    "mode": mode.value,
-                    "phase_filter": args.fault_phase,
+                    "location": location.value, "layer_idx": layer_idx,
+                    "mode": mode.value, "phase_filter": args.fault_phase,
                     "fault_seed": args.fault_seed,
                 }
-                print(f"[Fault] Activation fault registered: {fault_log}")
-
             else:
-                # 非 target layer 的激活故障（draft / lm_head）直接用 FaultInjector
                 activation_handle = injector.inject_activation_fault(
-                    location=location,
-                    mode=mode,
+                    location=location, mode=mode,
                     layer_idx=args.fault_layer_idx,
                     module_path=args.fault_module,
                     seed=args.fault_seed,
                 )
                 fault_log = activation_handle.as_log()
-                print(f"[Fault] Activation fault registered: {fault_log}")
+            print(f"[Fault] registered: {fault_log}")
 
     # ----------------------------------------------------------------
-    # 生成
+    # 构造样本列表
+    # 传了 --dataset → 批量；否则用 --prompt 单题
     # ----------------------------------------------------------------
-    print(f"\nPrompt : {args.prompt}")
-    print(f"γ={args.block_size}  T={args.temperature}\nGenerating…\n")
-
-    result = decoder.generate(
-        input_ids=input_ids,
-        max_new_tokens=args.max_new_tokens,
-        eos_token_id=tokenizer.eos_token_id,
-    )
+    if args.dataset is not None:
+        if not _DATASETS_AVAILABLE:
+            raise RuntimeError("datasets_loader.py not found.")
+        samples = load_benchmark(args.dataset, num_samples=args.num_samples, seed=args.seed)
+    else:
+        samples = [{"question": args.prompt, "answer": "", "source": "single", "sample_id": 0}]
 
     # ----------------------------------------------------------------
-    # 故障清理
+    # 主循环：对每道题跑 generate
+    # ----------------------------------------------------------------
+    all_results = []
+    n_correct = 0
+
+    for sample in samples:
+        prompt_text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": sample["question"]}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=args.enable_thinking,
+        )
+        input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(DEVICE)
+
+        result = decoder.generate(
+            input_ids=input_ids,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+        correct = False
+        if sample["answer"] and args.dataset is not None:
+            correct = is_correct(result["text"], sample["answer"], args.dataset)
+            if correct:
+                n_correct += 1
+
+        entry = {
+            "sample_id":  sample["sample_id"],
+            "source":     sample["source"],
+            "question":   sample["question"],
+            "reference":  sample["answer"],
+            "prediction": result["text"],
+            "is_correct": correct,
+            "metrics":    result["metrics"],
+            "trace":      result["trace"],
+        }
+        if fault_log:
+            entry["fault_log"] = fault_log
+        all_results.append(entry)
+
+        m = result["metrics"]
+        status = "✓" if correct else "✗"
+        print(f"[{sample['sample_id']:4d}] {status} "
+              f"accept={m['acceptance_rate']:.3f}  "
+              f"tokens={m['tokens_emitted']}")
+
+    # ----------------------------------------------------------------
+    # 清理 fault
     # ----------------------------------------------------------------
     if weight_snapshot is not None:
         injector.restore_weight(weight_snapshot)
     if activation_handle is not None:
-        if hasattr(activation_handle, "remove"):
-            activation_handle.remove()
-        else:
-            activation_handle.remove()
+        activation_handle.remove()
 
     # ----------------------------------------------------------------
-    # 输出
+    # 汇总输出
     # ----------------------------------------------------------------
-    m = result["metrics"]
+    total = len(all_results)
+    avg_accept = sum(r["metrics"]["acceptance_rate"] for r in all_results) / total
     print("=" * 60)
-    print(f"Output:\n{result['text']}")
+    if args.dataset is not None:
+        print(f"Dataset  : {args.dataset}  ({total} samples)")
+        print(f"Accuracy : {n_correct}/{total} = {n_correct/total:.4f}")
+    print(f"Avg acceptance rate : {avg_accept:.4f}")
     print("=" * 60)
-    print(f"Tokens emitted  : {m['tokens_emitted']}")
-    print(f"Acceptance rate : {m['acceptance_rate']:.3f}")
-    print(f"Base fwd calls  : {m['base_forward_calls']}")
-    print(f"Draft fwd calls : {m['draft_forward_calls']}")
-    print(f"Total time      : {m['generation_time']:.2f}s")
 
     if args.output_json:
-        output = {"metrics": m, "trace": result["trace"]}
-        if fault_log:
-            output["fault_log"] = fault_log
+        summary = {
+            "dataset":             args.dataset or "single",
+            "fault_log":           fault_log,
+            "total":               total,
+            "n_correct":           n_correct,
+            "accuracy":            n_correct / total if total > 0 else 0.0,
+            "avg_acceptance_rate": avg_accept,
+            "results":             all_results,
+        }
         with open(args.output_json, "w", encoding="utf-8") as f:
-            json.dump(output, f, indent=2, ensure_ascii=False)
-        print(f"Trace → {args.output_json}")
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        print(f"Results → {args.output_json}")
 
 
 if __name__ == "__main__":
