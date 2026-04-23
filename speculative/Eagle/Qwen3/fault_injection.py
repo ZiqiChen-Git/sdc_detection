@@ -384,10 +384,9 @@ class FaultInjector:
         """
         if seed is not None:
             random.seed(seed)
-          To restrict to one phase, set a flag from outside:
-              hook_state = {"phase_filter": "prefill_only", "triggered": False}
-          and check it inside a custom hook_fn passed via inject_custom_hook().
-        """
+        # To restrict to one phase, set a flag from outside:
+        #     hook_state = {"phase_filter": "prefill_only", "triggered": False}
+        # and check it inside a custom hook_fn passed via inject_custom_hook().
         module = self._resolve_module(location, layer_idx, module_path)
         hook_meta: Dict = {"triggered_count": 0, "fault_sites": []}
 
