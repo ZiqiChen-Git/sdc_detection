@@ -339,190 +339,27 @@ class TargetModelWithTaps:
 # EAGLE-3 Draft Head
 # ============================================================
 
-class Eagle3DraftLayer(nn.Module):
-    """
-    EAGLE-3 custom draft decoder layer.
-
-    Structure (matches RedHatAI/Qwen3-8B-Thinking-speculator.eagle3):
-      - self_attn: q/k/v proj accept 2H input (concat of [norm(embed), norm(fused)]),
-                   o_proj outputs back to H
-      - mlp: standard Qwen3 SwiGLU on H
-      - input_layernorm (on embed), hidden_norm (on fused), post_attention_layernorm
-
-    We hand-build attention to avoid fragile coupling to the private internals
-    of transformers' Qwen3Attention (whose API changed across versions and
-    whose `hidden_size` assumption is baked in).
-
-    Residual stream flows in H; attention projects 2H → (n_heads*head_dim) → H.
-    """
-
-    def __init__(self, target_cfg):
-        super().__init__()
-        H = target_cfg.hidden_size
-        n_heads = target_cfg.num_attention_heads
-        n_kv = target_cfg.num_key_value_heads
-        head_dim = getattr(target_cfg, "head_dim", H // n_heads)
-        rms_eps = target_cfg.rms_norm_eps
-        self.H = H
-        self.n_heads = n_heads
-        self.n_kv = n_kv
-        self.head_dim = head_dim
-
-        from transformers.models.qwen3.modeling_qwen3 import (
-            Qwen3MLP, Qwen3RMSNorm, Qwen3RotaryEmbedding
-        )
-
-        class _Attn(nn.Module):
-            pass
-        self.self_attn = _Attn()
-        # q: 2H -> n_heads*head_dim
-        self.self_attn.q_proj = nn.Linear(2 * H, n_heads * head_dim, bias=False)
-        # k,v: 2H -> n_kv*head_dim
-        self.self_attn.k_proj = nn.Linear(2 * H, n_kv * head_dim, bias=False)
-        self.self_attn.v_proj = nn.Linear(2 * H, n_kv * head_dim, bias=False)
-        # o: n_heads*head_dim -> H
-        self.self_attn.o_proj = nn.Linear(n_heads * head_dim, H, bias=False)
-
-        # Qwen3 has q/k layernorm inside attention (per-head norm)
-        self.self_attn.q_norm = Qwen3RMSNorm(head_dim, eps=rms_eps)
-        self.self_attn.k_norm = Qwen3RMSNorm(head_dim, eps=rms_eps)
-
-        self.mlp = Qwen3MLP(target_cfg)
-
-        self.input_layernorm = Qwen3RMSNorm(H, eps=rms_eps)
-        self.hidden_norm = Qwen3RMSNorm(H, eps=rms_eps)
-        self.post_attention_layernorm = Qwen3RMSNorm(H, eps=rms_eps)
-
-        # Rotary embeddings
-        self.rotary_emb = Qwen3RotaryEmbedding(config=target_cfg)
-
-    @staticmethod
-    def _apply_rope(x, cos, sin):
-        # x: (B, n_heads, T, head_dim)  cos/sin: (B, T, head_dim)
-        cos = cos.unsqueeze(1)  # (B, 1, T, head_dim)
-        sin = sin.unsqueeze(1)
-        d = x.shape[-1]
-        x1 = x[..., : d // 2]
-        x2 = x[..., d // 2:]
-        rotated = torch.cat([-x2, x1], dim=-1)
-        return x * cos + rotated * sin
-
-    def _repeat_kv(self, x, n_rep):
-        # x: (B, n_kv, T, head_dim) -> (B, n_kv*n_rep, T, head_dim)
-        if n_rep == 1:
-            return x
-        B, n_kv, T, D = x.shape
-        x = x[:, :, None, :, :].expand(B, n_kv, n_rep, T, D)
-        return x.reshape(B, n_kv * n_rep, T, D)
-
-    def forward(
-        self,
-        embeds: torch.Tensor,        # (B, T, H)
-        fused_hidden: torch.Tensor,  # (B, T, H)
-        position_ids: torch.Tensor,
-        past_key_value=None,
-        use_cache: bool = True,
-    ):
-        B, T, H = embeds.shape
-
-        # Normalize the two streams, concat to 2H
-        emb_n = self.input_layernorm(embeds)
-        fh_n = self.hidden_norm(fused_hidden)
-        attn_in = torch.cat([emb_n, fh_n], dim=-1)  # (B, T, 2H)
-
-        # Residual = fused_hidden (EAGLE-3 convention)
-        residual = fused_hidden
-
-        # Q/K/V projections
-        q = self.self_attn.q_proj(attn_in)  # (B, T, n_heads*head_dim)
-        k = self.self_attn.k_proj(attn_in)  # (B, T, n_kv*head_dim)
-        v = self.self_attn.v_proj(attn_in)
-
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, n_heads, T, hd)
-        k = k.view(B, T, self.n_kv, self.head_dim).transpose(1, 2)     # (B, n_kv,   T, hd)
-        v = v.view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
-
-        # Per-head RMSNorm (Qwen3 style)
-        q = self.self_attn.q_norm(q)
-        k = self.self_attn.k_norm(k)
-
-        # RoPE
-        # rotary_emb expects hidden_states and position_ids; returns (cos, sin) with shape (B, T, head_dim)
-        cos, sin = self.rotary_emb(v, position_ids)
-        q = self._apply_rope(q, cos, sin)
-        k = self._apply_rope(k, cos, sin)
-
-        # KV cache
-        if past_key_value is not None:
-            pk, pv = past_key_value
-            k = torch.cat([pk, k], dim=2)
-            v = torch.cat([pv, v], dim=2)
-        new_pkv = (k, v) if use_cache else None
-
-        # Repeat K/V for GQA
-        n_rep = self.n_heads // self.n_kv
-        k_rep = self._repeat_kv(k, n_rep)
-        v_rep = self._repeat_kv(v, n_rep)
-
-        # Scaled dot-product attention (causal)
-        # Use F.scaled_dot_product_attention for efficiency & correctness
-        attn = torch.nn.functional.scaled_dot_product_attention(
-            q, k_rep, v_rep,
-            is_causal=(k_rep.shape[2] == q.shape[2]),  # only causal during prefill; single-token decode doesn't need mask
-        )
-        # attn: (B, n_heads, T, head_dim) -> (B, T, n_heads*head_dim)
-        attn = attn.transpose(1, 2).contiguous().view(B, T, self.n_heads * self.head_dim)
-        attn_out = self.self_attn.o_proj(attn)  # (B, T, H)
-
-        h = residual + attn_out
-
-        # MLP
-        h2 = self.post_attention_layernorm(h)
-        h2 = self.mlp(h2)
-        h = h + h2
-
-        return h, new_pkv
-
-
 class Eagle3DraftHead(nn.Module):
     """
-    EAGLE-3 draft head matching RedHatAI/Qwen3-8B-Thinking-speculator.eagle3.
-
-    Checkpoint layout
-    -----------------
-      fc:                 [H, 3H]          project concat(f_l, f_m, f_h) → H
-      embed_tokens:       [V_target, H]    target vocab (151936)
-      layers.0.*:         custom draft layer with 2H attn input
-      norm:               [H]              final RMSNorm
-      lm_head:            [V_draft, H]     draft vocab (64000, smaller than target)
-      d2t:                [V_draft]        target_id = draft_id + d2t[draft_id]
-      t2d:                [V_target]       bool mask: which target ids are in draft
-
-    Forward returns target-vocab logits so the existing rejection-sampling
-    logic in Eagle3SpeculativeDecoder works unchanged.
+    Single-layer EAGLE-3 draft head loaded from official checkpoint.
+    Input  : token embedding  +  fused (f_l, f_m, f_h) from target
+    Output : token logits (LM head shared with target)
     """
 
     def __init__(self, draft_ckpt_path: str, target_model: nn.Module):
         super().__init__()
         cfg = target_model.config
         H = cfg.hidden_size
-        V_target = cfg.vocab_size
         n = len(target_model.model.layers)
         self.tap_indices = [n // 4, n // 2, n - 1]
-        self.H = H
-        self.V_target = V_target
-        self.V_draft = None
 
-        self.fc = nn.Linear(3 * H, H, bias=False)
-        self.embed_tokens = nn.Embedding(V_target, H)
-        self.draft_layer = Eagle3DraftLayer(cfg)
+        self.fc = nn.Linear(4 * H, H, bias=False)
 
-        from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
-        self.norm = Qwen3RMSNorm(H, eps=cfg.rms_norm_eps)
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+        self.draft_layer = Qwen3DecoderLayer(cfg, layer_idx=0)
 
-        self.lm_head = None  # built when we see the checkpoint
-        self.register_buffer("d2t", torch.zeros(0, dtype=torch.long), persistent=False)
-        self.register_buffer("t2d", torch.zeros(0, dtype=torch.bool), persistent=False)
+        self.embed_tokens = nn.Embedding(cfg.vocab_size, H)
+        self.lm_head = target_model.lm_head  # shared, no extra params
 
         self._load_weights(draft_ckpt_path)
         self.to(DEVICE)
@@ -530,14 +367,14 @@ class Eagle3DraftHead(nn.Module):
 
     def _load_weights(self, ckpt_path: str) -> None:
         import glob
-        files = sorted(glob.glob(os.path.join(ckpt_path, "*.safetensors")))
+        files = glob.glob(os.path.join(ckpt_path, "*.safetensors"))
         if files:
             from safetensors.torch import load_file
             state = {}
             for f in files:
                 state.update(load_file(f, device="cpu"))
         else:
-            files = sorted(glob.glob(os.path.join(ckpt_path, "*.bin")))
+            files = glob.glob(os.path.join(ckpt_path, "*.bin"))
             state = {}
             for f in files:
                 state.update(torch.load(f, map_location="cpu"))
@@ -549,87 +386,27 @@ class Eagle3DraftHead(nn.Module):
             return k
 
         s = {strip(k): v for k, v in state.items()}
-
-        # ----- fc -----
         if "fc.weight" in s:
-            w = s["fc.weight"]
-            in_dim = w.shape[1]
-            if in_dim != 3 * self.H:
-                self.fc = nn.Linear(in_dim, self.H, bias=False)
-            self.fc.weight = nn.Parameter(w)
-            print(f"[DraftHead] fc: {list(w.shape)}  (in={in_dim // self.H}H)")
-
-        # ----- embed_tokens -----
+            self.fc.weight = nn.Parameter(s["fc.weight"])
         if "embed_tokens.weight" in s:
-            w = s["embed_tokens.weight"]
-            if w.shape != self.embed_tokens.weight.shape:
-                self.embed_tokens = nn.Embedding(w.shape[0], w.shape[1])
-            self.embed_tokens.weight = nn.Parameter(w)
-
-        # ----- draft layer -----
-        layer_state = {k[len("layers.0."):]: v
-                       for k, v in s.items() if k.startswith("layers.0.")}
-        missing, unexpected = self.draft_layer.load_state_dict(layer_state, strict=False)
+            self.embed_tokens.weight = nn.Parameter(s["embed_tokens.weight"])
+        layer_state = {k[len("layers.0."):]: v for k, v in s.items() if k.startswith("layers.0.")}
+        missing, _ = self.draft_layer.load_state_dict(layer_state, strict=False)
         if missing:
-            print(f"[DraftHead] draft_layer missing: {missing}")
-        if unexpected:
-            print(f"[DraftHead] draft_layer unexpected: {unexpected}")
-
-        # ----- final norm -----
-        if "norm.weight" in s:
-            self.norm.weight = nn.Parameter(s["norm.weight"])
-
-        # ----- lm_head -----
-        if "lm_head.weight" in s:
-            w = s["lm_head.weight"]
-            V_draft, H = w.shape
-            self.V_draft = V_draft
-            self.lm_head = nn.Linear(H, V_draft, bias=False)
-            self.lm_head.weight = nn.Parameter(w)
-            print(f"[DraftHead] draft vocab = {V_draft}, target vocab = {self.V_target}")
-        else:
-            raise RuntimeError("lm_head.weight not found in checkpoint")
-
-        # ----- d2t / t2d -----
-        if "d2t" in s:
-            self.d2t = s["d2t"].long().to(DEVICE)
-        if "t2d" in s:
-            self.t2d = s["t2d"].bool().to(DEVICE)
+            print(f"[DraftHead] Missing keys (first 5): {missing[:5]}")
 
     def fuse(self, tapped: Dict[int, torch.Tensor]) -> Tuple[torch.Tensor, float]:
-        """Step 5: concat (f_l, f_m, f_h) → 3H and project to H."""
+        """
+        Step 5: project [f_l, f_m, f_h, f_h] → hidden_size.
+        Returns (fused (1,1,H), fused_norm).
+        """
         idxs = sorted(tapped.keys())
         parts = [tapped[i] for i in idxs]
-        if len(parts) < 3:
-            while len(parts) < 3:
-                parts.append(parts[-1])
-        cat = torch.cat(parts[:3], dim=-1).to(self.fc.weight.dtype)
+        while len(parts) < 4:
+            parts.append(parts[-1])
+        cat = torch.cat(parts[:4], dim=-1)
         fused = self.fc(cat)
         return fused, fused.float().norm().item()
-
-    def draft_to_target_logits(self, draft_logits: torch.Tensor) -> torch.Tensor:
-        """
-        Map draft-vocab logits (V_draft) -> target-vocab logits (V_target).
-        EAGLE-3 convention: target_id = draft_id + d2t[draft_id].
-        Positions not covered get -inf.
-        """
-        B = draft_logits.shape[0]
-        device = draft_logits.device
-        dtype = draft_logits.dtype
-        out = torch.full((B, self.V_target), float("-inf"), device=device, dtype=dtype)
-
-        if self.d2t.numel() == self.V_draft:
-            draft_idx = torch.arange(self.V_draft, device=device)
-            target_idx = draft_idx + self.d2t
-            valid = (target_idx >= 0) & (target_idx < self.V_target)
-            target_idx_v = target_idx[valid]
-            src = draft_logits[:, valid]
-            out[:, target_idx_v] = src
-        else:
-            # No mapping: assume vocabs align at the low end
-            n = min(draft_logits.shape[1], self.V_target)
-            out[:, :n] = draft_logits[:, :n]
-        return out
 
     @torch.no_grad()
     def forward_step(
@@ -639,22 +416,16 @@ class Eagle3DraftHead(nn.Module):
         past_key_values: Optional[Any],
         position_id: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, Any]:
-        """One draft step. Returns (target_vocab_logits, hidden, new_pkv)."""
+        """One draft autoregressive step. Returns (logits, hidden, new_pkv)."""
         token_t = torch.tensor([[prev_token_id]], device=DEVICE)
-        embed = self.embed_tokens(token_t).to(fused_hidden.dtype)  # (1,1,H)
+        embed = self.embed_tokens(token_t)
+        x = embed + fused_hidden
         pos = torch.tensor([[position_id]], device=DEVICE)
-
-        h, new_pkv = self.draft_layer(
-            embeds=embed,
-            fused_hidden=fused_hidden,
-            position_ids=pos,
-            past_key_value=past_key_values,
-            use_cache=True,
-        )
-        h = self.norm(h)
-        draft_logits = self.lm_head(h[:, -1, :])               # (1, V_draft)
-        target_logits = self.draft_to_target_logits(draft_logits)  # (1, V_target)
-        return target_logits, h[:, 0, :], new_pkv
+        layer_out = self.draft_layer(x, position_ids=pos, past_key_value=past_key_values, use_cache=True)
+        hidden = layer_out[0]
+        new_pkv = layer_out[1] if len(layer_out) > 1 else None
+        logits = self.lm_head(hidden[:, -1, :])
+        return logits, hidden[:, 0, :], new_pkv
 
 
 # ============================================================
