@@ -200,10 +200,15 @@ class WeightFaultSnapshot:
     fault_metadata: Dict = field(default_factory=dict)
 
     def as_log(self) -> Dict:
-        d = asdict(self)
-        d["original_value"] = self.original_value.item()
-        d["location"] = self.location.value
-        return d
+        return {
+            "location": self.location.value,
+            "module_path": self.module_path,
+            "layer_idx": self.layer_idx,
+            "row": self.row,
+            "col": self.col,
+            "original_value": self.original_value.item(),
+            "fault_metadata": self.fault_metadata,
+        }
 
 
 # ============================================================
