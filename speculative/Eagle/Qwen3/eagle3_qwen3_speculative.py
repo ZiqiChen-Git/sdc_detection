@@ -1058,7 +1058,15 @@ def main():
 
     print(f"Loading draft  : {args.draft_model_id}")
     draft_head = load_draft_head(args.draft_model_id, target_model, dtype)
-
+     # ===== 诊断 =====
+    print(f"=== Draft head sanity check ===")
+    print(f"V_draft: {draft_head.V_draft}, V_target: {draft_head.V_target}")
+    print(f"d2t shape: {draft_head.d2t.shape}, dtype: {draft_head.d2t.dtype}")
+    print(f"d2t[:20]: {draft_head.d2t[:20].tolist()}")
+    print(f"d2t min/max: {draft_head.d2t.min().item()} / {draft_head.d2t.max().item()}")
+    print(f"t2d shape: {draft_head.t2d.shape}, sum: {draft_head.t2d.sum().item()}")
+    print(f"================================")
+    # ===============
     tap_indices = draft_head.tap_indices
     print(f"Tapping layers : {tap_indices}")
 
