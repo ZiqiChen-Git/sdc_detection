@@ -51,6 +51,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field, asdict
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -168,20 +169,47 @@ def _softmax(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     return torch.softmax(logits / t, dim=-1).float()
 
 
+def sampling_probs(
+    logits: torch.Tensor,
+    temperature: float,
+    top_k: Optional[int],
+    do_sample: bool,
+    top_p: Optional[float] = None,
+) -> torch.Tensor:
+    if not do_sample or temperature <= 0:
+        return torch.softmax(logits, dim=-1).float()
+
+    scores = logits.float() / max(temperature, 1e-6)
+
+    if top_k is not None and 0 < top_k < scores.shape[-1]:
+        kth = torch.topk(scores, top_k, dim=-1).values[..., -1, None]
+        scores = scores.masked_fill(scores < kth, float("-inf"))
+
+    if top_p is not None and 0.0 < top_p < 1.0:
+        sorted_scores, sorted_idx = torch.sort(scores, descending=True, dim=-1)
+        sorted_probs = torch.softmax(sorted_scores, dim=-1)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        remove = cumulative > top_p
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        sorted_scores = sorted_scores.masked_fill(remove, float("-inf"))
+        scores = scores.scatter(dim=-1, index=sorted_idx, src=sorted_scores)
+
+    return torch.softmax(scores, dim=-1).float()
+
+
 def sample_token(
     logits: torch.Tensor,
     temperature: float,
-    top_k: int,
+    top_k: Optional[int],
     do_sample: bool,
+    top_p: Optional[float] = None,
 ) -> Tuple[int, float]:
-    probs = _softmax(logits, temperature)
+    probs = sampling_probs(logits, temperature, top_k, do_sample, top_p)
     if not do_sample or temperature <= 0:
         token_id = logits.argmax(dim=-1).item()
     else:
-        topk_p, topk_i = torch.topk(probs, min(top_k, probs.shape[-1]), dim=-1)
-        topk_p = topk_p / topk_p.sum(dim=-1, keepdim=True)
-        idx = torch.multinomial(topk_p, 1)
-        token_id = topk_i.gather(-1, idx).item()
+        token_id = torch.multinomial(probs, 1).item()
     return token_id, probs[0, token_id].item()
 
 
@@ -206,6 +234,48 @@ def kl_divergence(p: torch.Tensor, q: torch.Tensor) -> float:
 def entropy(probs: torch.Tensor) -> float:
     p = probs.float().clamp(min=EPS)
     return -(p * p.log()).sum().item()
+
+
+class EagleRMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
+class EagleMLP(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        from transformers.activations import ACT2FN
+
+        bias = getattr(cfg, "mlp_bias", False)
+        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=bias)
+        self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=bias)
+        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=bias)
+        self.act_fn = ACT2FN[cfg.hidden_act]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class EagleRotaryEmbedding(nn.Module):
+    def __init__(self, head_dim: int, base: float = 10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, position_ids: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        inv_freq = self.inv_freq.to(device=position_ids.device)
+        freqs = torch.einsum("bt,d->btd", position_ids.float(), inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
 
 
 # ============================================================
@@ -302,8 +372,15 @@ class TargetModelWithTaps:
         self.current_phase = "idle"
 
         logits = out.logits[:, -1, :]
-        tapped = {i: self._tapped[i][:, -1:, :].clone() for i in self.tap_indices}
-        return {"logits": logits, "tapped": tapped, "elapsed_s": elapsed, "input_len": input_ids.shape[1]}
+        tapped_full = {i: self._tapped[i].clone() for i in self.tap_indices}
+        tapped = {i: h[:, -1:, :].clone() for i, h in tapped_full.items()}
+        return {
+            "logits": logits,
+            "tapped": tapped,
+            "tapped_full": tapped_full,
+            "elapsed_s": elapsed,
+            "input_len": input_ids.shape[1],
+        }
 
     @torch.no_grad()
     def verify(self, context_ids: torch.Tensor, draft_token_ids: List[int]) -> Dict[str, Any]:
@@ -343,58 +420,49 @@ class Eagle3DraftLayer(nn.Module):
     """
     EAGLE-3 custom draft decoder layer.
 
-    Structure (matches RedHatAI/Qwen3-8B-Thinking-speculator.eagle3):
-      - self_attn: q/k/v proj accept 2H input (concat of [norm(embed), norm(fused)]),
-                   o_proj outputs back to H
-      - mlp: standard Qwen3 SwiGLU on H
-      - input_layernorm (on embed), hidden_norm (on fused), post_attention_layernorm
-
-    We hand-build attention to avoid fragile coupling to the private internals
-    of transformers' Qwen3Attention (whose API changed across versions and
-    whose `hidden_size` assumption is baked in).
-
-    Residual stream flows in H; attention projects 2H → (n_heads*head_dim) → H.
+    RedHat's Qwen3 EAGLE-3 speculator stores a Llama-style draft layer even
+    though the target model is Qwen3. Build from the speculator config, not
+    from the target config, while keeping the EAGLE 2H attention input.
     """
 
-    def __init__(self, target_cfg):
+    def __init__(self, draft_cfg):
         super().__init__()
-        H = target_cfg.hidden_size
-        n_heads = target_cfg.num_attention_heads
-        n_kv = target_cfg.num_key_value_heads
-        head_dim = getattr(target_cfg, "head_dim", H // n_heads)
-        rms_eps = target_cfg.rms_norm_eps
+        H = draft_cfg.hidden_size
+        n_heads = draft_cfg.num_attention_heads
+        n_kv = getattr(draft_cfg, "num_key_value_heads", n_heads)
+        head_dim = getattr(draft_cfg, "head_dim", H // n_heads)
+        rms_eps = getattr(draft_cfg, "rms_norm_eps", 1e-6)
+        attn_bias = getattr(draft_cfg, "attention_bias", False)
+        self.model_type = getattr(draft_cfg, "model_type", "llama")
+        self.norm_before_residual = getattr(draft_cfg, "norm_before_residual", False)
         self.H = H
         self.n_heads = n_heads
         self.n_kv = n_kv
         self.head_dim = head_dim
 
-        from transformers.models.qwen3.modeling_qwen3 import (
-            Qwen3MLP, Qwen3RMSNorm, Qwen3RotaryEmbedding
-        )
-
         class _Attn(nn.Module):
             pass
         self.self_attn = _Attn()
         # q: 2H -> n_heads*head_dim
-        self.self_attn.q_proj = nn.Linear(2 * H, n_heads * head_dim, bias=False)
+        self.self_attn.q_proj = nn.Linear(2 * H, n_heads * head_dim, bias=attn_bias)
         # k,v: 2H -> n_kv*head_dim
-        self.self_attn.k_proj = nn.Linear(2 * H, n_kv * head_dim, bias=False)
-        self.self_attn.v_proj = nn.Linear(2 * H, n_kv * head_dim, bias=False)
+        self.self_attn.k_proj = nn.Linear(2 * H, n_kv * head_dim, bias=attn_bias)
+        self.self_attn.v_proj = nn.Linear(2 * H, n_kv * head_dim, bias=attn_bias)
         # o: n_heads*head_dim -> H
-        self.self_attn.o_proj = nn.Linear(n_heads * head_dim, H, bias=False)
+        self.self_attn.o_proj = nn.Linear(n_heads * head_dim, H, bias=attn_bias)
 
-        # Qwen3 has q/k layernorm inside attention (per-head norm)
-        self.self_attn.q_norm = Qwen3RMSNorm(head_dim, eps=rms_eps)
-        self.self_attn.k_norm = Qwen3RMSNorm(head_dim, eps=rms_eps)
+        if self.model_type.lower().startswith("qwen3"):
+            self.self_attn.q_norm = EagleRMSNorm(head_dim, eps=rms_eps)
+            self.self_attn.k_norm = EagleRMSNorm(head_dim, eps=rms_eps)
 
-        self.mlp = Qwen3MLP(target_cfg)
+        self.mlp = EagleMLP(draft_cfg)
 
-        self.input_layernorm = Qwen3RMSNorm(H, eps=rms_eps)
-        self.hidden_norm = Qwen3RMSNorm(H, eps=rms_eps)
-        self.post_attention_layernorm = Qwen3RMSNorm(H, eps=rms_eps)
+        self.input_layernorm = EagleRMSNorm(H, eps=rms_eps)
+        self.hidden_norm = EagleRMSNorm(H, eps=rms_eps)
+        self.post_attention_layernorm = EagleRMSNorm(H, eps=rms_eps)
 
         # Rotary embeddings
-        self.rotary_emb = Qwen3RotaryEmbedding(config=target_cfg)
+        self.rotary_emb = EagleRotaryEmbedding(head_dim, base=getattr(draft_cfg, "rope_theta", 10000.0))
 
     @staticmethod
     def _apply_rope(x, cos, sin):
@@ -425,13 +493,13 @@ class Eagle3DraftLayer(nn.Module):
     ):
         B, T, H = embeds.shape
 
-        # Normalize the two streams, concat to 2H
+        # Normalize the two streams, concat to 2H. RedHat/speculators
+        # checkpoints use norm_before_residual=True for Qwen3 EAGLE-3.
         emb_n = self.input_layernorm(embeds)
         fh_n = self.hidden_norm(fused_hidden)
         attn_in = torch.cat([emb_n, fh_n], dim=-1)  # (B, T, 2H)
 
-        # Residual = fused_hidden (EAGLE-3 convention)
-        residual = fused_hidden
+        residual = fh_n if self.norm_before_residual else fused_hidden
 
         # Q/K/V projections
         q = self.self_attn.q_proj(attn_in)  # (B, T, n_heads*head_dim)
@@ -442,13 +510,13 @@ class Eagle3DraftLayer(nn.Module):
         k = k.view(B, T, self.n_kv, self.head_dim).transpose(1, 2)     # (B, n_kv,   T, hd)
         v = v.view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
 
-        # Per-head RMSNorm (Qwen3 style)
-        q = self.self_attn.q_norm(q)
-        k = self.self_attn.k_norm(k)
+        # Qwen3 draft checkpoints include per-head Q/K RMSNorm; Llama ones do not.
+        if hasattr(self.self_attn, "q_norm"):
+            q = self.self_attn.q_norm(q)
+            k = self.self_attn.k_norm(k)
 
         # RoPE
-        # rotary_emb expects hidden_states and position_ids; returns (cos, sin) with shape (B, T, head_dim)
-        cos, sin = self.rotary_emb(v, position_ids)
+        cos, sin = self.rotary_emb(position_ids, q.dtype)
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
 
@@ -505,20 +573,20 @@ class Eagle3DraftHead(nn.Module):
     def __init__(self, draft_ckpt_path: str, target_model: nn.Module):
         super().__init__()
         cfg = target_model.config
+        draft_cfg = self._load_draft_config(draft_ckpt_path, cfg)
         H = cfg.hidden_size
         V_target = cfg.vocab_size
         n = len(target_model.model.layers)
-        self.tap_indices = [n // 4, n // 2, n - 1]
+        self.tap_indices = self._tap_indices_from_config(draft_ckpt_path, n)
         self.H = H
         self.V_target = V_target
         self.V_draft = None
+        self.draft_cfg = draft_cfg
 
         self.fc = nn.Linear(3 * H, H, bias=False)
         self.embed_tokens = nn.Embedding(V_target, H)
-        self.draft_layer = Eagle3DraftLayer(cfg)
-
-        from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
-        self.norm = Qwen3RMSNorm(H, eps=cfg.rms_norm_eps)
+        self.draft_layer = Eagle3DraftLayer(draft_cfg)
+        self.norm = EagleRMSNorm(H, eps=getattr(draft_cfg, "rms_norm_eps", getattr(cfg, "rms_norm_eps", 1e-6)))
 
         self.lm_head = None  # built when we see the checkpoint
         self.register_buffer("d2t", torch.zeros(0, dtype=torch.long), persistent=False)
@@ -527,6 +595,74 @@ class Eagle3DraftHead(nn.Module):
         self._load_weights(draft_ckpt_path)
         self.to(DEVICE)
         self.eval()
+
+    @staticmethod
+    def _load_draft_config(ckpt_path: str, target_cfg) -> SimpleNamespace:
+        cfg_path = os.path.join(ckpt_path, "config.json")
+        raw: Dict[str, Any] = {}
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            layer_raw = raw.get("transformer_layer_config")
+            if isinstance(layer_raw, dict):
+                merged = dict(raw)
+                merged.update(layer_raw)
+                raw = merged
+            elif isinstance(raw.get("text_config"), dict):
+                merged = dict(raw)
+                merged.update(raw["text_config"])
+                raw = merged
+
+        def pick(name: str, default: Any) -> Any:
+            return raw.get(name, getattr(target_cfg, name, default))
+
+        hidden_act = raw.get(
+            "hidden_act",
+            raw.get("hidden_activation", getattr(target_cfg, "hidden_act", "silu")),
+        )
+        cfg = SimpleNamespace(
+            model_type=raw.get("model_type", getattr(target_cfg, "model_type", "llama")),
+            hidden_size=pick("hidden_size", target_cfg.hidden_size),
+            intermediate_size=pick("intermediate_size", getattr(target_cfg, "intermediate_size", 4 * target_cfg.hidden_size)),
+            num_attention_heads=pick("num_attention_heads", target_cfg.num_attention_heads),
+            num_key_value_heads=pick("num_key_value_heads", getattr(target_cfg, "num_key_value_heads", target_cfg.num_attention_heads)),
+            head_dim=pick("head_dim", target_cfg.hidden_size // target_cfg.num_attention_heads),
+            rms_norm_eps=pick("rms_norm_eps", getattr(target_cfg, "rms_norm_eps", 1e-6)),
+            rope_theta=pick("rope_theta", getattr(target_cfg, "rope_theta", 10000.0)),
+            hidden_act=hidden_act,
+            attention_bias=pick("attention_bias", False),
+            mlp_bias=pick("mlp_bias", False),
+            norm_before_residual=pick("norm_before_residual", False),
+        )
+        if cfg.hidden_size != target_cfg.hidden_size:
+            raise ValueError(
+                f"Draft hidden_size ({cfg.hidden_size}) must match target hidden_size ({target_cfg.hidden_size})."
+            )
+        print(
+            "[DraftHead] draft layer config: "
+            f"model_type={cfg.model_type}, hidden_act={cfg.hidden_act}, "
+            f"norm_before_residual={cfg.norm_before_residual}"
+        )
+        return cfg
+
+    @staticmethod
+    def _tap_indices_from_config(ckpt_path: str, num_layers: int) -> List[int]:
+        cfg_path = os.path.join(ckpt_path, "config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            for key in (
+                "eagle_aux_hidden_state_layer_ids",
+                "target_hidden_states_selection",
+                "target_hidden_state_layers",
+                "target_layer_indices",
+            ):
+                vals = raw.get(key)
+                if isinstance(vals, list) and vals:
+                    idxs = [int(v if v >= 0 else num_layers + v) for v in vals[:3]]
+                    return sorted(max(0, min(num_layers - 1, i)) for i in idxs)
+
+        return sorted({1, num_layers // 2, max(0, num_layers - 4)})
 
     def _load_weights(self, ckpt_path: str) -> None:
         import glob
@@ -607,6 +743,47 @@ class Eagle3DraftHead(nn.Module):
         fused = self.fc(cat)
         return fused, fused.float().norm().item()
 
+    @torch.no_grad()
+    def prefill_context(
+        self,
+        context_ids: torch.Tensor,
+        next_token_id: int,
+        tapped_full: Dict[int, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Any, torch.Tensor, int]:
+        """
+        Run the EAGLE layer over target hidden states for the existing context.
+        EAGLE pairs the previous-position verifier feature with the current
+        token embedding. The last context token is replaced by the verifier's
+        newly sampled next token, and the last output predicts the first draft
+        token after that verifier token.
+        """
+        fused_full, _ = self.fuse(tapped_full)
+        if context_ids.shape[1] > 1:
+            input_ids = torch.cat(
+                [
+                    context_ids[:, 1:],
+                    torch.tensor([[next_token_id]], device=DEVICE),
+                ],
+                dim=1,
+            )
+        else:
+            input_ids = torch.tensor([[next_token_id]], device=DEVICE)
+
+        embeds = self.embed_tokens(input_ids).to(fused_full.dtype)
+        prefill_len = input_ids.shape[1]
+        pos = torch.arange(prefill_len, device=DEVICE).unsqueeze(0)
+        h, pkv = self.draft_layer(
+            embeds=embeds,
+            fused_hidden=fused_full,
+            position_ids=pos,
+            past_key_value=None,
+            use_cache=True,
+        )
+        h_for_logits = self.norm(h)
+        draft_logits = self.lm_head(h_for_logits[:, -1, :])
+        target_logits = self.draft_to_target_logits(draft_logits)
+        return h[:, -1:, :], pkv, target_logits, prefill_len
+
     def draft_to_target_logits(self, draft_logits: torch.Tensor) -> torch.Tensor:
         """
         Map draft-vocab logits (V_draft) -> target-vocab logits (V_target).
@@ -639,7 +816,7 @@ class Eagle3DraftHead(nn.Module):
         past_key_values: Optional[Any],
         position_id: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, Any]:
-        """One draft step. Returns (target_vocab_logits, hidden, new_pkv)."""
+        """One draft step. Returns (target_vocab_logits, next_hidden, new_pkv)."""
         token_t = torch.tensor([[prev_token_id]], device=DEVICE)
         embed = self.embed_tokens(token_t).to(fused_hidden.dtype)  # (1,1,H)
         pos = torch.tensor([[position_id]], device=DEVICE)
@@ -651,10 +828,11 @@ class Eagle3DraftHead(nn.Module):
             past_key_value=past_key_values,
             use_cache=True,
         )
-        h = self.norm(h)
-        draft_logits = self.lm_head(h[:, -1, :])               # (1, V_draft)
+        next_hidden = h[:, -1:, :]
+        h_for_logits = self.norm(h)
+        draft_logits = self.lm_head(h_for_logits[:, -1, :])    # (1, V_draft)
         target_logits = self.draft_to_target_logits(draft_logits)  # (1, V_target)
-        return target_logits, h[:, 0, :], new_pkv
+        return target_logits, next_hidden, new_pkv
 
 
 # ============================================================
@@ -685,6 +863,7 @@ class Eagle3SpeculativeDecoder:
         block_size: int = 5,
         temperature: float = 0.0,
         top_k: int = 50,
+        top_p: Optional[float] = None,
         do_sample: bool = False,
     ):
         self.target = target
@@ -693,6 +872,7 @@ class Eagle3SpeculativeDecoder:
         self.block_size = block_size
         self.temperature = temperature
         self.top_k = top_k
+        self.top_p = top_p
         self.do_sample = do_sample
 
     def register_fault_hook(
@@ -719,29 +899,41 @@ class Eagle3SpeculativeDecoder:
     def _propose(
         self,
         context_ids: torch.Tensor,
-        fused: torch.Tensor,
+        draft_hidden: torch.Tensor,
+        past_key_values: Optional[Any],
+        first_logits: torch.Tensor,
+        next_position_id: int,
         fused_norm: float,
         eos_token_id: Optional[int],
         iteration: int,
+        max_steps: Optional[int] = None,
     ) -> Tuple[List[Dict], List[DraftTraceEvent]]:
         proposals = []
         draft_events = []
-        pkv = None
-        prev_token = context_ids[0, -1].item()
-        pos_offset = context_ids.shape[1] - 1
+        pkv = past_key_values
+        prev_token = None
+        steps = self.block_size if max_steps is None else min(self.block_size, max_steps)
 
-        for step in range(self.block_size):
+        for step in range(steps):
             t0 = time.time()
-            logits, hidden, pkv = self.draft.forward_step(
-                prev_token_id=prev_token,
-                fused_hidden=fused,
-                past_key_values=pkv,
-                position_id=pos_offset + step,
-            )
+            if step == 0:
+                logits = first_logits
+                hidden = draft_hidden
+            else:
+                logits, hidden, pkv = self.draft.forward_step(
+                    prev_token_id=prev_token,
+                    fused_hidden=draft_hidden,
+                    past_key_values=pkv,
+                    position_id=next_position_id + step - 1,
+                )
             elapsed = time.time() - t0
 
-            probs = _softmax(logits, self.temperature)
-            token_id, token_prob = sample_token(logits, self.temperature, self.top_k, self.do_sample)
+            probs = sampling_probs(
+                logits, self.temperature, self.top_k, self.do_sample, self.top_p
+            )
+            token_id, token_prob = sample_token(
+                logits, self.temperature, self.top_k, self.do_sample, self.top_p
+            )
 
             proposals.append({"token_id": token_id, "prob": token_prob, "probs": probs.detach()})
             draft_events.append(DraftTraceEvent(
@@ -757,6 +949,7 @@ class Eagle3SpeculativeDecoder:
             ))
 
             prev_token = token_id
+            draft_hidden = hidden
             if eos_token_id is not None and token_id == eos_token_id:
                 break
 
@@ -771,6 +964,7 @@ class Eagle3SpeculativeDecoder:
         proposals: List[Dict],
         fused_norm: float,
         iteration: int,
+        max_accept_tokens: Optional[int] = None,
     ) -> Tuple[List[int], torch.Tensor, VerifyTraceEvent]:
         draft_token_ids = [p["token_id"] for p in proposals]
         γ = len(proposals)
@@ -785,13 +979,23 @@ class Eagle3SpeculativeDecoder:
         first_reject: Optional[int] = None
 
         for i, proposal in enumerate(proposals):
+            if max_accept_tokens is not None and len(accepted_ids) >= max_accept_tokens:
+                break
+
             pos_logits    = verify_logits[:, i, :]
-            target_probs  = _softmax(pos_logits, self.temperature)
+            target_probs  = sampling_probs(
+                pos_logits, self.temperature, self.top_k, self.do_sample, self.top_p
+            )
             draft_probs   = proposal["probs"]
 
             target_prob   = target_probs[0, proposal["token_id"]].item()
             accept_ratio  = min(1.0, (target_prob + EPS) / (proposal["prob"] + EPS))
-            accepted      = (not self.do_sample) or (random.random() < accept_ratio)
+            if not self.do_sample or self.temperature <= 0:
+                base_id = pos_logits.argmax(dim=-1).item()
+                accepted = proposal["token_id"] == base_id
+            else:
+                base_id = -1
+                accepted = random.random() < accept_ratio
 
             kl    = kl_divergence(draft_probs, target_probs)
             h_norm = verify_hiddens[0, i, :].float().norm().item() if verify_hiddens is not None else 0.0
@@ -817,7 +1021,10 @@ class Eagle3SpeculativeDecoder:
             else:
                 if first_reject is None:
                     first_reject = i
-                base_id, _ = sample_token(pos_logits, self.temperature, self.top_k, self.do_sample)
+                if base_id < 0:
+                    base_id, _ = sample_token(
+                        pos_logits, self.temperature, self.top_k, self.do_sample, self.top_p
+                    )
                 accepted_ids.append(base_id)
                 context_ids = torch.cat([context_ids, torch.tensor([[base_id]], device=DEVICE)], dim=1)
                 break
@@ -887,7 +1094,9 @@ class Eagle3SpeculativeDecoder:
             f_m = tapped[idxs[1]] if len(idxs) > 1 else f_e
             f_l = tapped[idxs[-1]]
 
-            prefill_probs = _softmax(prefill_out["logits"], self.temperature)
+            prefill_probs = sampling_probs(
+                prefill_out["logits"], self.temperature, self.top_k, self.do_sample, self.top_p
+            )
             all_events.append(asdict(PrefillTraceEvent(
                 iteration=iteration,
                 input_len=prefill_out["input_len"],
@@ -899,15 +1108,46 @@ class Eagle3SpeculativeDecoder:
                 prefill_topk=topk_info(prefill_probs, self.tokenizer),
             )))
 
-            # ---- Step 5: Fuse features ------------------------------------
+            # ---- Step 5: sample verifier anchor and prefill EAGLE layer ---
+            anchor_id, anchor_prob = sample_token(
+                prefill_out["logits"], self.temperature, self.top_k, self.do_sample, self.top_p
+            )
             fused, fused_norm = self.draft.fuse(tapped)
+            context_with_anchor = torch.cat(
+                [context_ids, torch.tensor([[anchor_id]], device=DEVICE)], dim=1
+            )
+            generated_ids.append(anchor_id)
+            all_events.append(asdict(BridgeTraceEvent(
+                iteration=iteration,
+                base_token_id=anchor_id,
+                base_token=self.tokenizer.decode([anchor_id]),
+                base_prob=anchor_prob,
+                base_topk=topk_info(prefill_probs, self.tokenizer),
+                elapsed_s=prefill_out["elapsed_s"],
+            )))
+
+            metrics["base_only_tokens"] += 1
+            if eos_token_id is not None and anchor_id == eos_token_id:
+                context_ids = context_with_anchor
+                break
+            if len(generated_ids) >= max_new_tokens:
+                context_ids = context_with_anchor
+                break
+
+            t0 = time.time()
+            draft_hidden, draft_pkv, first_draft_logits, next_position_id = self.draft.prefill_context(
+                context_ids, anchor_id, prefill_out["tapped_full"]
+            )
+            draft_prefill_time = time.time() - t0
 
             # ---- Step 6: Draft proposals ----------------------------------
             t0 = time.time()
+            remaining = max_new_tokens - len(generated_ids)
             proposals, draft_events = self._propose(
-                context_ids, fused, fused_norm, eos_token_id, iteration
+                context_with_anchor, draft_hidden, draft_pkv, first_draft_logits,
+                next_position_id, fused_norm, eos_token_id, iteration, max_steps=remaining
             )
-            metrics["draft_time"]         += time.time() - t0
+            metrics["draft_time"]         += draft_prefill_time + time.time() - t0
             metrics["draft_forward_calls"] += len(proposals)
             metrics["proposals_generated"] += len(proposals)
 
@@ -915,11 +1155,13 @@ class Eagle3SpeculativeDecoder:
                 all_events.append(asdict(de))
 
             if not proposals:
+                context_ids = context_with_anchor
                 break
 
             # ---- Step 7+9+10: Batched verify + rejection sampling ---------
             accepted_ids, context_ids, verify_event = self._verify_and_sample(
-                context_ids, proposals, fused_norm, iteration
+                context_with_anchor, proposals, fused_norm, iteration,
+                max_accept_tokens=max_new_tokens - len(generated_ids)
             )
             metrics["base_forward_calls"] += 1
             metrics["base_time"]          += verify_event.elapsed_s
@@ -934,32 +1176,6 @@ class Eagle3SpeculativeDecoder:
                 break
             if len(generated_ids) >= max_new_tokens:
                 break
-
-            # ---- Step 12 / Bridge: if all γ accepted, get one more token --
-            if verify_event.num_rejected == 0:
-                t0 = time.time()
-                bridge_out = self.target.prefill(context_ids)
-                metrics["base_forward_calls"] += 1
-                metrics["base_time"]          += time.time() - t0
-
-                bridge_id, bridge_prob = sample_token(
-                    bridge_out["logits"], self.temperature, self.top_k, self.do_sample
-                )
-                bridge_probs = _softmax(bridge_out["logits"], self.temperature)
-                all_events.append(asdict(BridgeTraceEvent(
-                    iteration=iteration,
-                    base_token_id=bridge_id,
-                    base_token=self.tokenizer.decode([bridge_id]),
-                    base_prob=bridge_prob,
-                    base_topk=topk_info(bridge_probs, self.tokenizer),
-                    elapsed_s=bridge_out["elapsed_s"],
-                )))
-                context_ids = torch.cat([context_ids, torch.tensor([[bridge_id]], device=DEVICE)], dim=1)
-                generated_ids.append(bridge_id)
-                metrics["base_only_tokens"] += 1
-
-                if eos_token_id is not None and bridge_id == eos_token_id:
-                    break
 
         metrics["generation_time"] = time.time() - start_time
         metrics["acceptance_rate"] = (
@@ -1074,7 +1290,7 @@ def main():
     decoder = Eagle3SpeculativeDecoder(
         target=target_wrapped, draft_head=draft_head, tokenizer=tokenizer,
         block_size=args.block_size, temperature=args.temperature,
-        top_k=args.top_k, do_sample=do_sample,
+        top_k=args.top_k, top_p=args.top_p, do_sample=do_sample,
     )
 
     # ----------------------------------------------------------------
