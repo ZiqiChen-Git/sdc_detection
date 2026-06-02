@@ -426,7 +426,7 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
         self,
         selected_nodes: List[TreeDraftNode],
         target_by_node: Dict[int, Dict[str, Any]],
-    ) -> Tuple[List[int], Optional[int], Dict[int, str]]:
+    ) -> Tuple[List[int], Optional[int], Dict[int, str], int]:
         paths = self._leaf_paths(selected_nodes)
         best_path = paths[0] if paths else []
         accepted_ids: List[int] = []
@@ -458,13 +458,13 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
                 status[node.node_id] = "rejected_at_position"
                 break
 
-        return accepted_ids, first_reject, status
+        return accepted_ids, first_reject, status, len(best_path)
 
     def _accept_greedy_tree(
         self,
         selected_nodes: List[TreeDraftNode],
         target_by_node: Dict[int, Dict[str, Any]],
-    ) -> Tuple[List[int], Optional[int], Dict[int, str]]:
+    ) -> Tuple[List[int], Optional[int], Dict[int, str], int]:
         children: Dict[Optional[int], List[TreeDraftNode]] = {}
         for node in selected_nodes:
             children.setdefault(node.parent_id, []).append(node)
@@ -476,11 +476,13 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
         status = {n.node_id: "sibling_not_chosen" for n in selected_nodes}
         parent_id: Optional[int] = None
         depth = 0
+        chosen_path_len = 0
 
         while True:
             candidates = children.get(parent_id, [])
             if not candidates:
                 break
+            chosen_path_len += 1
             probe = candidates[0]
             target_probs = sampling_probs(
                 target_by_node[probe.node_id]["logits"],
@@ -500,7 +502,7 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
             parent_id = matched.node_id
             depth += 1
 
-        return accepted_ids, first_reject, status
+        return accepted_ids, first_reject, status, chosen_path_len
 
     def _verify_accept_tree(
         self,
@@ -515,9 +517,9 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
         accept_mode = self._resolved_accept_mode()
 
         if accept_mode == "greedy_tree":
-            accepted_ids, first_reject, status = self._accept_greedy_tree(selected_nodes, target_by_node)
+            accepted_ids, first_reject, status, chosen_path_len = self._accept_greedy_tree(selected_nodes, target_by_node)
         elif accept_mode == "single_path_strict":
-            accepted_ids, first_reject, status = self._accept_single_path_strict(selected_nodes, target_by_node)
+            accepted_ids, first_reject, status, chosen_path_len = self._accept_single_path_strict(selected_nodes, target_by_node)
         else:
             raise ValueError(
                 "tree_accept_mode must be auto, greedy_tree, or single_path_strict. "
@@ -570,6 +572,8 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
 
         actual_accepted = sum(1 for v in status.values() if v == "accepted_path")
         actual_rejected = 1 if first_reject is not None else 0
+        path_tokens_checked = actual_accepted + actual_rejected
+        path_acceptance_rate = actual_accepted / path_tokens_checked if path_tokens_checked else 0.0
         event = VerifyTraceEvent(
             iteration=iteration,
             block_size_proposed=len(selected_nodes),
@@ -589,6 +593,11 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
             "verify_backend": verify_out["backend"],
             "fallback_reason": verify_out["fallback_reason"],
             "tree_accept_mode": accept_mode,
+            "chosen_path_len": chosen_path_len,
+            "path_tokens_checked": path_tokens_checked,
+            "path_tokens_accepted": actual_accepted,
+            "path_acceptance_rate_this_block": path_acceptance_rate,
+            "node_acceptance_rate_this_block": actual_accepted / len(selected_nodes) if selected_nodes else 0.0,
             "paper_note": (
                 "EAGLE-3 adopts EAGLE-2 dynamic trees. Target verification is "
                 "parallel only when verify_backend=tree_attention succeeds."
@@ -619,6 +628,8 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
             "iteration_count": 0,
             "tree_nodes_generated": 0,
             "tree_nodes_verified": 0,
+            "path_tokens_checked": 0,
+            "path_tokens_accepted": 0,
         }
         tree_metadata_events: List[Dict[str, Any]] = []
         start_time = time.time()
@@ -719,6 +730,8 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
             metrics["accepted_proposals"] += verify_event.num_accepted
             metrics["rejected_proposals"] += verify_event.num_rejected
             metrics["base_only_tokens"] += verify_event.num_rejected
+            metrics["path_tokens_checked"] += verify_meta["path_tokens_checked"]
+            metrics["path_tokens_accepted"] += verify_meta["path_tokens_accepted"]
 
             verify_dict = asdict(verify_event)
             verify_dict["phase"] = "verify_tree"
@@ -733,10 +746,20 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
                 break
 
         metrics["generation_time"] = time.time() - start_time
-        metrics["acceptance_rate"] = (
+        metrics["node_acceptance_rate"] = (
             metrics["accepted_proposals"] / metrics["proposals_generated"]
             if metrics["proposals_generated"] > 0
             else 0.0
+        )
+        metrics["path_acceptance_rate"] = (
+            metrics["path_tokens_accepted"] / metrics["path_tokens_checked"]
+            if metrics["path_tokens_checked"] > 0
+            else 0.0
+        )
+        metrics["acceptance_rate"] = metrics["path_acceptance_rate"]
+        metrics["acceptance_rate_definition"] = (
+            "tree path_tokens_accepted/path_tokens_checked; "
+            "node_acceptance_rate is accepted_path_nodes/selected_tree_nodes"
         )
         metrics["tokens_emitted"] = len(generated_ids)
         metrics["tree_verify_backends"] = sorted({m["verify_backend"] for m in tree_metadata_events})
@@ -923,7 +946,12 @@ def main():
         all_results.append(entry)
         m = result["metrics"]
         status = "ok" if correct else "na"
-        print(f"[{sample['sample_id']:4d}] {status} accept={m['acceptance_rate']:.3f} tokens={m['tokens_emitted']} backends={m.get('tree_verify_backends')}")
+        print(
+            f"[{sample['sample_id']:4d}] {status} "
+            f"path_accept={m['path_acceptance_rate']:.3f} "
+            f"node_accept={m['node_acceptance_rate']:.3f} "
+            f"tokens={m['tokens_emitted']} backends={m.get('tree_verify_backends')}"
+        )
 
     if weight_snapshot is not None:
         injector.restore_weight(weight_snapshot)
