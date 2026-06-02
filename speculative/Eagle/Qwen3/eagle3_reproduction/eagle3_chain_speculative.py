@@ -93,6 +93,11 @@ class PositionVerifyData:
     accepted: bool
     target_topk: List[Dict]          # top-5 tokens from target distribution
     kl_draft_target: float           # KL(draft || target) – SDC anomaly signal
+    raw_draft_prob: float            # unfiltered model prob, for diagnosis only
+    raw_target_prob: float           # unfiltered model prob, for diagnosis only
+    raw_acceptance_ratio: float      # diagnostic ratio; not used for sampling
+    raw_target_topk: List[Dict]      # top-5 tokens before top-k/top-p filtering
+    raw_kl_draft_target: float       # KL on unfiltered model distributions
     target_hidden_norm: float        # L2 norm of target hidden state here
     fused_feature_norm: float        # filled in after fuse step
 
@@ -108,6 +113,7 @@ class PrefillTraceEvent:
     f_late_norm: float = 0.0         # Step 4: norm of late-layer feature
     top_hidden_norm: float = 0.0
     prefill_topk: List[Dict] = field(default_factory=list)
+    raw_prefill_topk: List[Dict] = field(default_factory=list)
 
 
 @dataclass
@@ -120,6 +126,9 @@ class DraftTraceEvent:
     draft_prob: float = 0.0
     draft_entropy: float = 0.0       # entropy of draft distribution
     draft_topk: List[Dict] = field(default_factory=list)
+    raw_draft_prob: float = 0.0
+    raw_draft_entropy: float = 0.0
+    raw_draft_topk: List[Dict] = field(default_factory=list)
     draft_hidden_norm: float = 0.0   # norm of draft layer output
     elapsed_s: float = 0.0
 
@@ -150,6 +159,8 @@ class BridgeTraceEvent:
     base_token: str = ""
     base_prob: float = 0.0
     base_topk: List[Dict] = field(default_factory=list)
+    raw_base_prob: float = 0.0
+    raw_base_topk: List[Dict] = field(default_factory=list)
     elapsed_s: float = 0.0
 
 
@@ -196,6 +207,11 @@ def sampling_probs(
         scores = scores.scatter(dim=-1, index=sorted_idx, src=sorted_scores)
 
     return torch.softmax(scores, dim=-1).float()
+
+
+def diagnostic_probs(logits: torch.Tensor) -> torch.Tensor:
+    """Unfiltered model distribution for trace diagnostics; not used for sampling."""
+    return torch.softmax(logits.float(), dim=-1).float()
 
 
 def sample_token(
@@ -946,11 +962,19 @@ class Eagle3SpeculativeDecoder:
             probs = sampling_probs(
                 logits, self.temperature, self.top_k, self.do_sample, self.top_p
             )
+            raw_probs = diagnostic_probs(logits)
             token_id, token_prob = sample_token(
                 logits, self.temperature, self.top_k, self.do_sample, self.top_p
             )
+            raw_token_prob = raw_probs[0, token_id].item()
 
-            proposals.append({"token_id": token_id, "prob": token_prob, "probs": probs.detach()})
+            proposals.append({
+                "token_id": token_id,
+                "prob": token_prob,
+                "probs": probs.detach(),
+                "raw_prob": raw_token_prob,
+                "raw_probs": raw_probs.detach(),
+            })
             draft_events.append(DraftTraceEvent(
                 iteration=iteration,
                 draft_step=step,
@@ -959,6 +983,9 @@ class Eagle3SpeculativeDecoder:
                 draft_prob=token_prob,
                 draft_entropy=entropy(probs),
                 draft_topk=topk_info(probs, self.tokenizer),
+                raw_draft_prob=raw_token_prob,
+                raw_draft_entropy=entropy(raw_probs),
+                raw_draft_topk=topk_info(raw_probs, self.tokenizer),
                 draft_hidden_norm=hidden.float().norm().item(),
                 elapsed_s=elapsed,
             ))
@@ -1001,10 +1028,14 @@ class Eagle3SpeculativeDecoder:
             target_probs  = sampling_probs(
                 pos_logits, self.temperature, self.top_k, self.do_sample, self.top_p
             )
+            raw_target_probs = diagnostic_probs(pos_logits)
             draft_probs   = proposal["probs"]
+            raw_draft_probs = proposal["raw_probs"]
 
             target_prob   = target_probs[0, proposal["token_id"]].item()
+            raw_target_prob = raw_target_probs[0, proposal["token_id"]].item()
             accept_ratio  = min(1.0, (target_prob + EPS) / (proposal["prob"] + EPS))
+            raw_accept_ratio = min(1.0, (raw_target_prob + EPS) / (proposal["raw_prob"] + EPS))
             if not self.do_sample or self.temperature <= 0:
                 base_id = pos_logits.argmax(dim=-1).item()
                 accepted = proposal["token_id"] == base_id
@@ -1013,6 +1044,7 @@ class Eagle3SpeculativeDecoder:
                 accepted = random.random() < accept_ratio
 
             kl    = kl_divergence(draft_probs, target_probs)
+            raw_kl = kl_divergence(raw_draft_probs, raw_target_probs)
             h_norm = verify_hiddens[0, i, :].float().norm().item() if verify_hiddens is not None else 0.0
 
             per_position.append(PositionVerifyData(
@@ -1025,6 +1057,11 @@ class Eagle3SpeculativeDecoder:
                 accepted=accepted,
                 target_topk=topk_info(target_probs, self.tokenizer),
                 kl_draft_target=kl,
+                raw_draft_prob=proposal["raw_prob"],
+                raw_target_prob=raw_target_prob,
+                raw_acceptance_ratio=raw_accept_ratio,
+                raw_target_topk=topk_info(raw_target_probs, self.tokenizer),
+                raw_kl_draft_target=raw_kl,
                 target_hidden_norm=h_norm,
                 fused_feature_norm=fused_norm,
             ))
@@ -1111,6 +1148,7 @@ class Eagle3SpeculativeDecoder:
             prefill_probs = sampling_probs(
                 prefill_out["logits"], self.temperature, self.top_k, self.do_sample, self.top_p
             )
+            raw_prefill_probs = diagnostic_probs(prefill_out["logits"])
             all_events.append(asdict(PrefillTraceEvent(
                 iteration=iteration,
                 input_len=prefill_out["input_len"],
@@ -1120,6 +1158,7 @@ class Eagle3SpeculativeDecoder:
                 f_late_norm=f_l.float().norm().item(),
                 top_hidden_norm=f_l.float().norm().item(),
                 prefill_topk=topk_info(prefill_probs, self.tokenizer),
+                raw_prefill_topk=topk_info(raw_prefill_probs, self.tokenizer),
             )))
 
             # ---- Step 5: sample verifier anchor and prefill EAGLE layer ---
@@ -1137,6 +1176,8 @@ class Eagle3SpeculativeDecoder:
                 base_token=self.tokenizer.decode([anchor_id]),
                 base_prob=anchor_prob,
                 base_topk=topk_info(prefill_probs, self.tokenizer),
+                raw_base_prob=raw_prefill_probs[0, anchor_id].item(),
+                raw_base_topk=topk_info(raw_prefill_probs, self.tokenizer),
                 elapsed_s=prefill_out["elapsed_s"],
             )))
 
@@ -1461,6 +1502,19 @@ def main():
         summary = {
             "dataset":             args.dataset or "single",
             "fault_log":           fault_log,
+            "generation_args": {
+                "base_model_id": args.base_model_id,
+                "draft_model_id": args.draft_model_id,
+                "max_new_tokens": args.max_new_tokens,
+                "block_size": args.block_size,
+                "temperature": args.temperature,
+                "top_k": args.top_k,
+                "top_p": args.top_p,
+                "do_sample": do_sample,
+                "enable_thinking": args.enable_thinking,
+                "seed": args.seed,
+                "dtype": args.dtype,
+            },
             "total":               total,
             "n_correct":           n_correct,
             "accuracy":            n_correct / total if total > 0 else 0.0,

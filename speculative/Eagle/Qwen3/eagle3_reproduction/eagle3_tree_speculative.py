@@ -61,6 +61,7 @@ from eagle3_chain_speculative import (
     VerifyTraceEvent,
     _DATASETS_AVAILABLE,
     _FAULT_INJECTION_AVAILABLE,
+    diagnostic_probs,
     entropy,
     is_correct,
     kl_divergence,
@@ -91,6 +92,7 @@ class TreeDraftNode:
     parent_hidden: Any = None
     parent_pkv: Any = None
     draft_probs: Any = None
+    raw_draft_probs: Any = None
 
 
 class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
@@ -149,6 +151,7 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
         next_node_id: int,
     ) -> Tuple[List[TreeDraftNode], int]:
         probs = sampling_probs(logits, self.temperature, self.top_k, self.do_sample, self.top_p)
+        raw_probs = diagnostic_probs(logits)
         k = min(self.tree_branch_factor, probs.shape[-1])
         vals, idxs = torch.topk(probs, k, dim=-1)
         nodes: List[TreeDraftNode] = []
@@ -157,6 +160,8 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
         for i in range(k):
             token_id = idxs[0, i].item()
             token_prob = vals[0, i].item()
+            if token_prob <= 0.0:
+                continue
             nodes.append(
                 TreeDraftNode(
                     node_id=next_node_id,
@@ -171,6 +176,7 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
                     parent_hidden=parent_hidden,
                     parent_pkv=parent_pkv,
                     draft_probs=probs.detach(),
+                    raw_draft_probs=raw_probs.detach(),
                 )
             )
             next_node_id += 1
@@ -281,6 +287,9 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
                     draft_prob=node.token_prob,
                     draft_entropy=node.draft_entropy,
                     draft_topk=topk_info(node.draft_probs, self.tokenizer),
+                    raw_draft_prob=node.raw_draft_probs[0, node.token_id].item(),
+                    raw_draft_entropy=entropy(node.raw_draft_probs),
+                    raw_draft_topk=topk_info(node.raw_draft_probs, self.tokenizer),
                     draft_hidden_norm=node.draft_hidden_norm,
                     elapsed_s=0.0,
                 )
@@ -537,9 +546,14 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
         for pos, node in enumerate(selected_nodes):
             pos_logits = target_by_node[node.node_id]["logits"]
             target_probs = sampling_probs(pos_logits, self.temperature, self.top_k, self.do_sample, self.top_p)
+            raw_target_probs = diagnostic_probs(pos_logits)
             target_prob = target_probs[0, node.token_id].item()
+            raw_target_prob = raw_target_probs[0, node.token_id].item()
             accept_ratio = min(1.0, (target_prob + EPS) / (node.token_prob + EPS))
+            raw_draft_prob = node.raw_draft_probs[0, node.token_id].item()
+            raw_accept_ratio = min(1.0, (raw_target_prob + EPS) / (raw_draft_prob + EPS))
             kl = kl_divergence(node.draft_probs, target_probs)
+            raw_kl = kl_divergence(node.raw_draft_probs, raw_target_probs)
             h_norm = target_by_node[node.node_id]["hidden_norm"]
             kls.append(kl)
             hnorms.append(h_norm)
@@ -555,6 +569,11 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
                     accepted=status.get(node.node_id) == "accepted_path",
                     target_topk=topk_info(target_probs, self.tokenizer),
                     kl_draft_target=kl,
+                    raw_draft_prob=raw_draft_prob,
+                    raw_target_prob=raw_target_prob,
+                    raw_acceptance_ratio=raw_accept_ratio,
+                    raw_target_topk=topk_info(raw_target_probs, self.tokenizer),
+                    raw_kl_draft_target=raw_kl,
                     target_hidden_norm=h_norm,
                     fused_feature_norm=fused_norm,
                 )
@@ -652,6 +671,7 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
             prefill_probs = sampling_probs(
                 prefill_out["logits"], self.temperature, self.top_k, self.do_sample, self.top_p
             )
+            raw_prefill_probs = diagnostic_probs(prefill_out["logits"])
             all_events.append(
                 asdict(
                     PrefillTraceEvent(
@@ -663,6 +683,7 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
                         f_late_norm=f_l.float().norm().item(),
                         top_hidden_norm=f_l.float().norm().item(),
                         prefill_topk=topk_info(prefill_probs, self.tokenizer),
+                        raw_prefill_topk=topk_info(raw_prefill_probs, self.tokenizer),
                     )
                 )
             )
@@ -681,6 +702,8 @@ class Eagle3TreeSpeculativeDecoder(Eagle3SpeculativeDecoder):
                         base_token=self.tokenizer.decode([anchor_id]),
                         base_prob=anchor_prob,
                         base_topk=topk_info(prefill_probs, self.tokenizer),
+                        raw_base_prob=raw_prefill_probs[0, anchor_id].item(),
+                        raw_base_topk=topk_info(raw_prefill_probs, self.tokenizer),
                         elapsed_s=prefill_out["elapsed_s"],
                     )
                 )
@@ -979,6 +1002,19 @@ def main():
                 "tree_verify_nodes": args.tree_verify_nodes,
                 "verify_backend": args.verify_backend,
                 "tree_accept_mode": args.tree_accept_mode,
+            },
+            "generation_args": {
+                "base_model_id": args.base_model_id,
+                "draft_model_id": args.draft_model_id,
+                "max_new_tokens": args.max_new_tokens,
+                "block_size": args.block_size,
+                "temperature": args.temperature,
+                "top_k": args.top_k,
+                "top_p": args.top_p,
+                "do_sample": do_sample,
+                "enable_thinking": args.enable_thinking,
+                "seed": args.seed,
+                "dtype": args.dtype,
             },
             "total": total,
             "n_correct": n_correct,
