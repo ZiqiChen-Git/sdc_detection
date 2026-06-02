@@ -1457,6 +1457,7 @@ def main():
     print("=" * 60)
 
     if args.output_json:
+        os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
         summary = {
             "dataset":             args.dataset or "single",
             "fault_log":           fault_log,
