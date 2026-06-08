@@ -1,4 +1,5 @@
 speculative_outputs/
+outputs/
 
 # Python bytecode/cache files
 __pycache__/
