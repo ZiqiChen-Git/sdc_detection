@@ -768,7 +768,24 @@ def load_samples(args: argparse.Namespace) -> List[Dict[str, Any]]:
     if args.dataset is not None:
         if not _DATASETS_AVAILABLE:
             raise RuntimeError("datasets_loader.py not found.")
-        return load_benchmark(args.dataset, num_samples=args.num_samples, seed=args.seed)
+        samples = load_benchmark(args.dataset, num_samples=None, seed=args.seed)
+        if args.sample_ids:
+            wanted = {int(x.strip()) for x in args.sample_ids.split(",") if x.strip()}
+            samples = [sample for sample in samples if int(sample.get("sample_id", -1)) in wanted]
+            found = {int(sample.get("sample_id", -1)) for sample in samples}
+            missing = sorted(wanted - found)
+            if missing:
+                raise ValueError(f"--sample_ids includes missing ids: {missing}")
+        if args.exclude_sample_ids:
+            excluded = {int(x.strip()) for x in args.exclude_sample_ids.split(",") if x.strip()}
+            samples = [sample for sample in samples if int(sample.get("sample_id", -1)) not in excluded]
+        if args.max_question_chars is not None:
+            samples = [sample for sample in samples if len(sample["question"]) <= args.max_question_chars]
+        if args.num_samples is not None:
+            rng = random.Random(args.seed)
+            samples = rng.sample(samples, min(args.num_samples, len(samples)))
+        print(f"[Dataset] Selected {len(samples)} sample(s) after runner filters")
+        return samples
     return [{"question": args.prompt, "answer": "", "source": "single", "sample_id": 0}]
 
 
@@ -833,6 +850,9 @@ def parse_args() -> argparse.Namespace:
         "gsm8k", "math500", "aime2024", "aime2025", "gpqa", "livecodebench", "openthoughts"
     ])
     parser.add_argument("--num_samples", type=int, default=None)
+    parser.add_argument("--sample_ids", default=None, help="Comma-separated dataset sample ids to run, e.g. 0,1,2.")
+    parser.add_argument("--exclude_sample_ids", default=None, help="Comma-separated dataset sample ids to skip.")
+    parser.add_argument("--max_question_chars", type=int, default=None, help="Keep only short questions for quick pilots.")
     parser.add_argument("--prompt", default="What is 25 * 48?")
 
     parser.add_argument("--tree_depth", type=int, default=6)
