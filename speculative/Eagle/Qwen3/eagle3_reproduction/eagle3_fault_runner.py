@@ -629,18 +629,23 @@ def trace_summary(trace: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def format_prompt(tokenizer: Any, question: str, enable_thinking: bool) -> str:
-    content = (
-        question
-        + "\n\nSolve the problem and put the final numeric answer after '####'."
-    )
+def format_prompt(tokenizer: Any, question: str, args: argparse.Namespace) -> str:
+    if args.prompt_style == "concise_math":
+        instruction = (
+            "Solve this math problem. Keep the reasoning concise, then write the final "
+            "numeric answer on a separate line starting with '####'."
+        )
+    else:
+        instruction = "Solve the problem and put the final numeric answer after '####'."
+
+    content = question + "\n\n" + instruction
     messages = [{"role": "user", "content": content}]
     try:
         return tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=enable_thinking,
+            enable_thinking=args.enable_thinking,
         )
     except TypeError:
         return tokenizer.apply_chat_template(
@@ -659,7 +664,7 @@ def run_decode(
 ) -> Dict[str, Any]:
     seed_everything(run_seed)
     started = time.time()
-    prompt_text = format_prompt(tokenizer, sample["question"], args.enable_thinking)
+    prompt_text = format_prompt(tokenizer, sample["question"], args)
     input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(DEVICE)
     try:
         result = decoder.generate(
@@ -686,19 +691,31 @@ def run_decode(
         }
     correct = False
     extracted_answer = ""
+    prediction = result["text"]
+    metrics = result["metrics"]
+    stop_reason = "eos" if result["tokens"] and result["tokens"][-1] == tokenizer.eos_token_id else "max_new_tokens"
+    completion_diagnostics = {
+        "stop_reason": stop_reason,
+        "hit_max_new_tokens": stop_reason == "max_new_tokens" and metrics.get("tokens_emitted") == args.max_new_tokens,
+        "has_think_open": "<think>" in prediction,
+        "has_think_close": "</think>" in prediction,
+        "has_final_marker": "####" in prediction,
+        "prompt_style": args.prompt_style,
+    }
     if args.dataset is not None and sample.get("answer"):
-        extracted_answer = extract_answer(result["text"], args.dataset)
-        correct = is_correct(result["text"], sample["answer"], args.dataset)
+        extracted_answer = extract_answer(prediction, args.dataset)
+        correct = is_correct(prediction, sample["answer"], args.dataset)
 
     entry = {
         "sample_id": sample.get("sample_id"),
         "source": sample.get("source"),
         "question": sample["question"],
         "reference": sample.get("answer", ""),
-        "prediction": result["text"],
+        "prediction": prediction,
         "extracted_answer": extracted_answer,
         "is_correct": correct,
-        "metrics": result["metrics"],
+        "metrics": metrics,
+        "completion_diagnostics": completion_diagnostics,
         "trace_summary": trace_summary(result["trace"]),
         "run_seed": run_seed,
         "execution_status": "success",
@@ -841,6 +858,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_k", type=int, default=10)
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--enable_thinking", action="store_true", default=True)
+    parser.add_argument("--prompt_style", default="default", choices=["default", "concise_math"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--output_json", default=None)
@@ -916,7 +934,9 @@ def main() -> None:
         print(
             f"[baseline sample={sample_id}] "
             f"accept={baseline['metrics'].get('acceptance_rate', 0.0):.4f} "
-            f"tokens={baseline['metrics'].get('tokens_emitted', 0)}"
+            f"tokens={baseline['metrics'].get('tokens_emitted', 0)} "
+            f"stop={baseline.get('completion_diagnostics', {}).get('stop_reason', 'unknown')} "
+            f"final_marker={baseline.get('completion_diagnostics', {}).get('has_final_marker', False)}"
         )
 
     print(f"Running {args.num_fault_trials} fault trial(s) per sample.")
@@ -950,6 +970,7 @@ def main() -> None:
                 f"loc={fault.log.get('location')} type={fault.log.get('fault_type')} "
                 f"mode={fault.log.get('fault_mode')} "
                 f"accept={trial['metrics'].get('acceptance_rate', 0.0):.4f} "
+                f"stop={trial.get('completion_diagnostics', {}).get('stop_reason', 'unknown')} "
                 f"triggered={fault.log.get('runtime', {}).get('triggered', 'weight')}"
             )
 
@@ -984,6 +1005,7 @@ def main() -> None:
             "top_k": args.top_k,
             "top_p": args.top_p,
             "enable_thinking": args.enable_thinking,
+            "prompt_style": args.prompt_style,
             "seed": args.seed,
             "dtype": args.dtype,
         },
