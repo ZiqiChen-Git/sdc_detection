@@ -117,7 +117,7 @@ multi-branch posterior rule, so this file does not guess one.
 
 ## Fault injection
 
-Both scripts keep the previous CLI controls:
+Both decoder scripts keep the previous single-run CLI controls:
 
 ```bash
 --fault_location target_layer \
@@ -140,3 +140,129 @@ The trace still includes the old SDC fields:
 - `target_hidden_norm`
 - `fused_feature_norm`
 
+For statistical fault injection, use `eagle3_fault_runner.py`. It keeps the
+chain/tree decoder logic unchanged and injects one fault per inference trial.
+The default fault mode is double-bit, matching the main memory-fault emphasis
+in the SC2025 reliability setup.
+
+Each run creates a clear output folder. If `--output_dir` is omitted, the
+folder is created under `outputs/eagle3_reproduction/fault_runs/` with a
+timestamp and fault-setting slug. The layout is:
+
+```text
+<run_dir>/
+  raw_results.json
+  baselines/sample_<sample_id>.json
+  trials/trial_<trial_idx>_sample_<sample_id>.json
+  analysis/analysis_summary.json
+  analysis/analysis_trials.jsonl
+  analysis/analysis_by_site.json
+  analysis/analysis_report.md
+```
+
+Baseline and trial JSON files include the normal generation metrics, tokens,
+and full trace by default. Use `--trace_mode summary` or `--no_store_tokens`
+only when the run is too large.
+
+Target weight fault with a fully controlled site:
+
+```bash
+python eagle3_fault_runner.py \
+  --base_model_id /home/czq/models/Qwen3-8B \
+  --draft_model_id /home/czq/models/RedHatAI/Qwen3-8B-Thinking-speculator___eagle3 \
+  --prompt "What is 25 * 48?" \
+  --num_fault_trials 10 \
+  --fault_location target_layer \
+  --fault_type weight \
+  --fault_mode double_bit \
+  --fault_layer_idx 16 \
+  --fault_module mlp.gate_proj \
+  --fault_row 0 \
+  --fault_col 0 \
+  --fault_bit_positions 7,12 \
+  --output_dir outputs/eagle3_reproduction/fault_runs/target_layer_weight_demo
+```
+
+Target verify-only activation fault:
+
+```bash
+python eagle3_fault_runner.py \
+  --base_model_id /home/czq/models/Qwen3-8B \
+  --draft_model_id /home/czq/models/RedHatAI/Qwen3-8B-Thinking-speculator___eagle3 \
+  --prompt "What is 25 * 48?" \
+  --num_fault_trials 10 \
+  --fault_location target_layer \
+  --fault_type activation \
+  --fault_mode double_bit \
+  --fault_layer_idx 16 \
+  --fault_module mlp.gate_proj \
+  --fault_phase verify \
+  --fault_token_idx 0 \
+  --fault_hidden_idx 128 \
+  --output_dir outputs/eagle3_reproduction/fault_runs/target_verify_activation_demo
+```
+
+EAGLE-3 tap-only feature fault:
+
+```bash
+python eagle3_fault_runner.py \
+  --base_model_id /home/czq/models/Qwen3-8B \
+  --draft_model_id /home/czq/models/RedHatAI/Qwen3-8B-Thinking-speculator___eagle3 \
+  --prompt "What is 25 * 48?" \
+  --num_fault_trials 10 \
+  --fault_location target_tap \
+  --fault_type activation \
+  --fault_mode double_bit \
+  --fault_tap_slot mid \
+  --fault_phase prefill \
+  --output_dir outputs/eagle3_reproduction/fault_runs/mid_tap_activation_demo
+```
+
+Useful controllable fields:
+
+- `--fault_location`: `target_layer`, `target_tap`, `target_embed`,
+  `target_lm_head`, `draft_embed`, `draft_fc`, `draft_layer`, `draft_lm_head`,
+  or `random`.
+- `--fault_layer_idx` and `--fault_module`: choose transformer layer and module.
+  If omitted for `target_layer` / `draft_layer`, the runner samples them.
+- `--fault_row`, `--fault_col`: choose exact weight coordinates.
+- `--fault_token_idx`, `--fault_hidden_idx`: choose exact activation coordinates.
+- `--fault_bit_positions`: choose exact bit positions such as `7,12`.
+- `--fault_phase`: for target-side activation faults, choose `prefill`,
+  `verify`, or `both`.
+- `--decoder tree`: run the same FI harness on the tree reproduction.
+- `--no_auto_analyze`: skip automatic analysis if you only want raw traces.
+
+## Linear-layer profile pre-experiment
+
+Use `eagle3_linear_profile.py` before large FI runs if you want a small
+evidence table for why FI focuses on high-compute / high-memory linear layers.
+It records target linear modules, tap-vs-non-tap target layers, `draft_fc`, and
+draft-layer linear modules.
+
+```bash
+python eagle3_linear_profile.py \
+  --base_model_id /home/czq/models/Qwen3-8B \
+  --draft_model_id /home/czq/models/RedHatAI/Qwen3-8B-Thinking-speculator___eagle3 \
+  --prompt "What is 25 * 48?" \
+  --max_new_tokens 32 \
+  --profile_iterations 1 \
+  --block_size 3 \
+  --temperature 0.2 \
+  --top_k 10 \
+  --top_p 0.9 \
+  --output_dir outputs/eagle3_reproduction/profiles/linear_profile_32tok
+```
+
+Outputs:
+
+```text
+<output_dir>/
+  profile_summary.json
+  module_profile.csv
+  profile_report.md
+```
+
+The report is only for experiment planning, not a rigorous serving benchmark.
+Forward hooks add overhead, but the relative module-size and rough module-time
+pattern is enough to justify concentrating FI on linear layers.
