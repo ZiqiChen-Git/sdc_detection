@@ -31,6 +31,7 @@ datasets_loader.py
 
 import re
 import random
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
@@ -47,11 +48,12 @@ def load_dataset(
     """
     加载指定数据集，返回统一格式的样本列表。
 
-    name: gsm8k | math500 | aime2024 | aime2025 | gpqa | livecodebench | openthoughts
+    name: gsm8k | tinygsm8k | math500 | aime2024 | aime2025 | gpqa | livecodebench | openthoughts
     num_samples: None 表示加载全部
     """
     loaders = {
         "gsm8k":          _load_gsm8k,
+        "tinygsm8k":      _load_tinygsm8k,
         "math500":        _load_math500,
         "aime2024":       _load_aime2024,
         "aime2025":       _load_aime2025,
@@ -86,6 +88,24 @@ def _load_gsm8k(split: str = "test") -> List[Dict]:
             "source":    "gsm8k",
             "sample_id": i,
             "raw_answer": row["answer"],
+        }
+        for i, row in enumerate(ds)
+    ]
+
+
+def _load_tinygsm8k(split: str = "test") -> List[Dict]:
+    from datasets import load_dataset as hf_load
+
+    data_file = _local_tinygsm8k_file(split)
+    ds = hf_load("parquet", data_files={split: str(data_file)}, split=split)
+    return [
+        {
+            "question": row["question"],
+            "answer": _gsm8k_extract_answer(row["answer"]),
+            "source": "tinygsm8k",
+            "sample_id": i,
+            "raw_answer": row["answer"],
+            "local_dataset_path": str(data_file),
         }
         for i, row in enumerate(ds)
     ]
@@ -214,7 +234,7 @@ def extract_answer(text: str, dataset_name: str) -> str:
     """
     cleaned = _strip_thinking(text)
 
-    if dataset_name == "gsm8k":
+    if dataset_name in ("gsm8k", "tinygsm8k"):
         return _extract_last_number(cleaned)
 
     elif dataset_name in ("math500", "aime2024", "aime2025"):
@@ -269,6 +289,18 @@ def _gsm8k_extract_answer(text: str) -> str:
     if "####" in text:
         return text.split("####")[-1].strip()
     return text.strip()
+
+
+def _local_tinygsm8k_file(split: str) -> Path:
+    filename = f"{split}-00000-of-00001.parquet"
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "data_bundle" / "tinyGSM8k" / "main" / filename
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        "Local tinyGSM8k parquet not found. Expected data_bundle/tinyGSM8k/main/"
+        f"{filename} under this repository."
+    )
 
 
 def _strip_thinking(text: str) -> str:

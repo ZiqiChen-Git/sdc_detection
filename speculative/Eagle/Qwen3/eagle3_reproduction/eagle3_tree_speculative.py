@@ -804,7 +804,7 @@ def _parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--output_json", default=None)
-    parser.add_argument("--dataset", default=None, choices=["gsm8k", "math500", "aime2024", "aime2025", "gpqa", "livecodebench", "openthoughts"])
+    parser.add_argument("--dataset", default=None, choices=["gsm8k", "tinygsm8k", "math500", "aime2024", "aime2025", "gpqa", "livecodebench", "openthoughts"])
     parser.add_argument("--num_samples", type=int, default=None)
     parser.add_argument("--prompt", default="What is 25 * 48?")
 

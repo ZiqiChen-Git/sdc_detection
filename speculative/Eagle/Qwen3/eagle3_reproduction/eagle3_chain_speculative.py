@@ -1285,7 +1285,7 @@ def main():
     parser.add_argument("--output_json",    default=None)
     # ---- 数据集 / 单题 ----
     parser.add_argument("--dataset",        default=None,
-                        choices=["gsm8k", "math500", "aime2024", "aime2025",
+                        choices=["gsm8k", "tinygsm8k", "math500", "aime2024", "aime2025",
                                  "gpqa", "livecodebench", "openthoughts"],
                         help="传入数据集名称则批量跑；不传则用 --prompt 单题模式。")
     parser.add_argument("--num_samples",    type=int, default=None,

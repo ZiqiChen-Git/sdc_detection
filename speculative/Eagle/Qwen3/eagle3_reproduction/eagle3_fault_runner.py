@@ -847,7 +847,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", default=None)
 
     parser.add_argument("--dataset", default=None, choices=[
-        "gsm8k", "math500", "aime2024", "aime2025", "gpqa", "livecodebench", "openthoughts"
+        "gsm8k", "tinygsm8k", "math500", "aime2024", "aime2025", "gpqa", "livecodebench", "openthoughts"
     ])
     parser.add_argument("--num_samples", type=int, default=None)
     parser.add_argument("--sample_ids", default=None, help="Comma-separated dataset sample ids to run, e.g. 0,1,2.")
