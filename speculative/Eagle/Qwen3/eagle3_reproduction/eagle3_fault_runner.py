@@ -33,6 +33,7 @@ from eagle3_chain_speculative import (
     TargetModelWithTaps,
     _DATASETS_AVAILABLE,
     is_correct,
+    extract_answer,
     load_benchmark,
     load_draft_head,
     load_target_model,
@@ -629,7 +630,11 @@ def trace_summary(trace: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def format_prompt(tokenizer: Any, question: str, enable_thinking: bool) -> str:
-    messages = [{"role": "user", "content": question}]
+    content = (
+        question
+        + "\n\nSolve the problem and put the final numeric answer after '####'."
+    )
+    messages = [{"role": "user", "content": content}]
     try:
         return tokenizer.apply_chat_template(
             messages,
@@ -680,7 +685,9 @@ def run_decode(
             "elapsed_s": time.time() - started,
         }
     correct = False
+    extracted_answer = ""
     if args.dataset is not None and sample.get("answer"):
+        extracted_answer = extract_answer(result["text"], args.dataset)
         correct = is_correct(result["text"], sample["answer"], args.dataset)
 
     entry = {
@@ -689,6 +696,7 @@ def run_decode(
         "question": sample["question"],
         "reference": sample.get("answer", ""),
         "prediction": result["text"],
+        "extracted_answer": extracted_answer,
         "is_correct": correct,
         "metrics": result["metrics"],
         "trace_summary": trace_summary(result["trace"]),

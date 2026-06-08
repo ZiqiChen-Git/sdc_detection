@@ -212,11 +212,7 @@ def extract_answer(text: str, dataset_name: str) -> str:
     thinking 模型的输出格式：<think>...</think> 答案
     先把 <think> 块去掉，再在剩余文本里找答案。
     """
-    # 去掉 thinking 部分
-    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    # 如果没有 </think>，取最后出现的内容（有些模型不闭合标签）
-    if "<think>" in cleaned:
-        cleaned = cleaned.split("<think>")[0].strip()
+    cleaned = _strip_thinking(text)
 
     if dataset_name == "gsm8k":
         return _extract_last_number(cleaned)
@@ -273,6 +269,22 @@ def _gsm8k_extract_answer(text: str) -> str:
     if "####" in text:
         return text.split("####")[-1].strip()
     return text.strip()
+
+
+def _strip_thinking(text: str) -> str:
+    """
+    Return the visible answer region of a thinking-model response.
+
+    If a complete </think> tag exists, evaluate only the content after the last
+    closing tag. If generation was truncated before </think>, keep the generated
+    thinking content instead of returning the empty prefix before <think>; this
+    makes truncation diagnosable and avoids falsely extracting nothing.
+    """
+    if "</think>" in text:
+        return text.rsplit("</think>", 1)[-1].strip()
+    if "<think>" in text:
+        return text.split("<think>", 1)[-1].strip()
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
 def _boxed_extract(text: str) -> str:
