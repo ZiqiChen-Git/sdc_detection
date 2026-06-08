@@ -20,6 +20,7 @@ import json
 import os
 import random
 import time
+import traceback
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -652,13 +653,32 @@ def run_decode(
     run_seed: int,
 ) -> Dict[str, Any]:
     seed_everything(run_seed)
+    started = time.time()
     prompt_text = format_prompt(tokenizer, sample["question"], args.enable_thinking)
     input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(DEVICE)
-    result = decoder.generate(
-        input_ids=input_ids,
-        max_new_tokens=args.max_new_tokens,
-        eos_token_id=tokenizer.eos_token_id,
-    )
+    try:
+        result = decoder.generate(
+            input_ids=input_ids,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    except Exception as exc:
+        return {
+            "sample_id": sample.get("sample_id"),
+            "source": sample.get("source"),
+            "question": sample["question"],
+            "reference": sample.get("answer", ""),
+            "prediction": "",
+            "is_correct": False,
+            "metrics": {},
+            "trace_summary": {},
+            "run_seed": run_seed,
+            "execution_status": "error",
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "error_traceback": traceback.format_exc(limit=8),
+            "elapsed_s": time.time() - started,
+        }
     correct = False
     if args.dataset is not None and sample.get("answer"):
         correct = is_correct(result["text"], sample["answer"], args.dataset)
@@ -673,6 +693,10 @@ def run_decode(
         "metrics": result["metrics"],
         "trace_summary": trace_summary(result["trace"]),
         "run_seed": run_seed,
+        "execution_status": "success",
+        "error_type": None,
+        "error_message": None,
+        "elapsed_s": time.time() - started,
     }
     if args.trace_mode == "full":
         entry["trace"] = result["trace"]

@@ -164,6 +164,66 @@ Baseline and trial JSON files include the normal generation metrics, tokens,
 and full trace by default. Use `--trace_mode summary` or `--no_store_tokens`
 only when the run is too large.
 
+### Preliminary TODO workflow
+
+This workflow directly addresses the two preliminary TODO items:
+
+- SDC effect on reasoning output.
+- SDC effect on execution status.
+
+Run a small pilot first:
+
+```bash
+cd ~/projects/sdc_detection/speculative/Eagle/Qwen3/eagle3_reproduction
+
+python eagle3_fault_runner.py \
+  --base_model_id /home/czq/models/Qwen3-8B \
+  --draft_model_id /home/czq/models/RedHatAI/Qwen3-8B-Thinking-speculator___eagle3 \
+  --dataset gsm8k \
+  --num_samples 5 \
+  --num_fault_trials 5 \
+  --decoder chain \
+  --max_new_tokens 256 \
+  --block_size 3 \
+  --temperature 0.2 \
+  --top_k 10 \
+  --top_p 0.9 \
+  --fault_location random \
+  --fault_type activation \
+  --fault_mode double_bit \
+  --fault_phase verify \
+  --output_dir outputs/eagle3_reproduction/fault_runs/prelim_gsm8k_verify_activation
+```
+
+Generate the TODO-specific report:
+
+```bash
+python eagle3_prelim_todo_report.py \
+  --run_dir outputs/eagle3_reproduction/fault_runs/prelim_gsm8k_verify_activation
+```
+
+Read:
+
+```text
+outputs/eagle3_reproduction/fault_runs/prelim_gsm8k_verify_activation/analysis/preliminary_todo_report.md
+```
+
+For reasoning-output effect, report:
+
+- `output_changed_rate`
+- `token_changed_rate`
+- `baseline_correct_then_wrong_rate`
+- `mean_token_edit_distance_norm`
+- `mean_acceptance_delta`
+- `mean_verify_kl_delta`
+
+For execution-status effect, report:
+
+- `execution_status_changed_rate`
+- `baseline_success_then_fault_error_rate`
+- `fault execution status counts`
+- `fault error type counts`
+
 Target weight fault with a fully controlled site:
 
 ```bash

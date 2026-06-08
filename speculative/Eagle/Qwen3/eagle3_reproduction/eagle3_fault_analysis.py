@@ -86,6 +86,10 @@ def get_trace_summary(entry: Dict[str, Any]) -> Dict[str, Any]:
     return entry.get("trace_summary") or {}
 
 
+def get_execution_status(entry: Dict[str, Any]) -> str:
+    return entry.get("execution_status") or "success"
+
+
 def fault_site_key(fault_log: Dict[str, Any]) -> str:
     parts = [
         fault_log.get("location", "unknown"),
@@ -125,6 +129,8 @@ def compare_trial(baseline: Dict[str, Any], trial: Dict[str, Any]) -> Dict[str, 
     token_changed = base_tokens != trial_tokens
     baseline_correct_then_wrong = bool(baseline.get("is_correct")) and not bool(trial.get("is_correct"))
     fault_log = trial.get("fault_log") or {}
+    baseline_status = get_execution_status(baseline)
+    fault_status = get_execution_status(trial)
 
     return {
         "sample_id": trial.get("sample_id"),
@@ -135,6 +141,12 @@ def compare_trial(baseline: Dict[str, Any], trial: Dict[str, Any]) -> Dict[str, 
         "token_changed": token_changed,
         "baseline_correct_then_wrong": baseline_correct_then_wrong,
         "is_correct": bool(trial.get("is_correct")),
+        "baseline_execution_status": baseline_status,
+        "fault_execution_status": fault_status,
+        "execution_status_changed": baseline_status != fault_status,
+        "baseline_success_then_fault_error": baseline_status == "success" and fault_status != "success",
+        "fault_error_type": trial.get("error_type"),
+        "fault_error_message": trial.get("error_message"),
         "divergence_index": div_idx,
         "token_edit_distance": edit,
         "token_edit_distance_norm": edit / max_len,
@@ -166,6 +178,10 @@ def summarize_records(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         "token_changed_rate": safe_rate(sum(1 for r in records if r["token_changed"]), total),
         "baseline_correct_then_wrong": sum(1 for r in records if r["baseline_correct_then_wrong"]),
         "baseline_correct_then_wrong_rate": safe_rate(sum(1 for r in records if r["baseline_correct_then_wrong"]), total),
+        "execution_status_changed": sum(1 for r in records if r["execution_status_changed"]),
+        "execution_status_changed_rate": safe_rate(sum(1 for r in records if r["execution_status_changed"]), total),
+        "baseline_success_then_fault_error": sum(1 for r in records if r["baseline_success_then_fault_error"]),
+        "baseline_success_then_fault_error_rate": safe_rate(sum(1 for r in records if r["baseline_success_then_fault_error"]), total),
         "fault_correct": sum(1 for r in records if r["is_correct"]),
         "fault_accuracy": safe_rate(sum(1 for r in records if r["is_correct"]), total),
         "mean_text_similarity": mean(r["text_similarity"] for r in records),
@@ -221,6 +237,8 @@ def write_report(path: str, summary: Dict[str, Any], by_site: Dict[str, Any]) ->
         f"- Output changed rate: {summary['output_changed_rate']:.4f}",
         f"- Token changed rate: {summary['token_changed_rate']:.4f}",
         f"- Baseline-correct-then-wrong rate: {summary['baseline_correct_then_wrong_rate']:.4f}",
+        f"- Execution status changed rate: {summary['execution_status_changed_rate']:.4f}",
+        f"- Baseline-success-then-fault-error rate: {summary['baseline_success_then_fault_error_rate']:.4f}",
         f"- Fault accuracy: {summary['fault_accuracy']:.4f}",
         f"- Mean fault acceptance rate: {summary['mean_fault_acceptance_rate']:.4f}",
         f"- Mean acceptance delta: {summary['mean_acceptance_delta']:.4f}",
@@ -236,6 +254,8 @@ def write_report(path: str, summary: Dict[str, Any], by_site: Dict[str, Any]) ->
             f"- Trials: {vals['total_trials']}",
             f"- Output changed rate: {vals['output_changed_rate']:.4f}",
             f"- Token changed rate: {vals['token_changed_rate']:.4f}",
+            f"- Execution status changed rate: {vals['execution_status_changed_rate']:.4f}",
+            f"- Baseline-success-then-fault-error rate: {vals['baseline_success_then_fault_error_rate']:.4f}",
             f"- Fault accuracy: {vals['fault_accuracy']:.4f}",
             f"- Mean acceptance delta: {vals['mean_acceptance_delta']:.4f}",
             f"- Mean verify KL delta: {vals['mean_verify_kl_delta']:.4f}",
