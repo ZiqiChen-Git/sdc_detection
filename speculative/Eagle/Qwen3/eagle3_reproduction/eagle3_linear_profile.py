@@ -65,11 +65,15 @@ class ModuleStats:
     calls: int = 0
     total_time_s: float = 0.0
     times_s: List[float] = field(default_factory=list)
+    phase_calls: Dict[str, int] = field(default_factory=dict)
+    phase_times_s: Dict[str, float] = field(default_factory=dict)
 
-    def add_time(self, elapsed_s: float) -> None:
+    def add_time(self, elapsed_s: float, phase: str) -> None:
         self.calls += 1
         self.total_time_s += elapsed_s
         self.times_s.append(elapsed_s)
+        self.phase_calls[phase] = self.phase_calls.get(phase, 0) + 1
+        self.phase_times_s[phase] = self.phase_times_s.get(phase, 0.0) + elapsed_s
 
     def as_dict(self) -> Dict[str, Any]:
         avg = self.total_time_s / self.calls if self.calls else 0.0
@@ -82,6 +86,8 @@ class ModuleStats:
             "calls": self.calls,
             "total_time_s": self.total_time_s,
             "avg_time_s": avg,
+            "phase_calls": dict(self.phase_calls),
+            "phase_times_s": dict(self.phase_times_s),
         }
 
 
@@ -89,6 +95,7 @@ class LinearProfiler:
     def __init__(self):
         self.stats: Dict[str, ModuleStats] = {}
         self.handles: List[Any] = []
+        self._start_times: Dict[str, Any] = {}
         self.enabled = False
         self.phase = "idle"
 
@@ -116,17 +123,18 @@ class LinearProfiler:
                 return
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            _module.__profile_start_s = time.perf_counter()
+            self._start_times[key] = (time.perf_counter(), self.phase)
 
         def post_hook(_module, _inputs, _output):
             if not self.enabled:
                 return
-            start = getattr(_module, "__profile_start_s", None)
-            if start is None:
+            start_item = self._start_times.pop(key, None)
+            if start_item is None:
                 return
+            start, phase = start_item
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            self.stats[key].add_time(time.perf_counter() - start)
+            self.stats[key].add_time(time.perf_counter() - start, phase)
 
         self.handles.append(module.register_forward_pre_hook(pre_hook))
         self.handles.append(module.register_forward_hook(post_hook))
@@ -373,6 +381,7 @@ def summarize_modules(stats: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     total_params = sum(row["param_count"] for row in stats)
     total_time = sum(row["total_time_s"] for row in stats)
+    total_calls = sum(row["calls"] for row in stats)
     for row in stats:
         row["param_share"] = row["param_count"] / total_params if total_params else 0.0
         row["time_share"] = row["total_time_s"] / total_time if total_time else 0.0
@@ -380,6 +389,8 @@ def summarize_modules(stats: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "total_linear_params_profiled": total_params,
         "total_linear_hook_time_s": total_time,
+        "total_linear_hook_calls": total_calls,
+        "linear_hook_time_available": total_calls > 0,
         "by_module_type": by_module_type,
         "by_scope": by_scope,
     }
@@ -411,9 +422,22 @@ def write_report(path: str, summary: Dict[str, Any], rows: List[Dict[str, Any]])
     lines = [
         "# EAGLE-3 Linear Layer Profile",
         "",
-        "## Phase Time",
+        "## Hook Health",
         "",
     ]
+    total_calls = summary["module_summary"]["total_linear_hook_calls"]
+    total_time = summary["module_summary"]["total_linear_hook_time_s"]
+    if total_calls:
+        lines.append(f"- linear hooks triggered: {total_calls} call(s), {total_time:.6f}s total")
+    else:
+        lines.append("- WARNING: linear hooks did not trigger; module-level time fields are not usable.")
+        lines.append("- Parameter counts are still usable for FI site selection.")
+
+    lines.extend([
+        "",
+        "## Phase Time",
+        "",
+    ])
     for phase, elapsed in sorted(summary["phase_times_s"].items(), key=lambda item: item[1], reverse=True):
         calls = summary["phase_calls"].get(phase, 0)
         lines.append(f"- {phase}: {elapsed:.6f}s over {calls} call(s)")
