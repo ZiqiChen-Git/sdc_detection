@@ -466,15 +466,18 @@ def install_module_activation_fault(
             return True
         return getattr(target_wrapped, "current_phase", "idle") == phase_filter
 
+    def should_inject(call_idx: int) -> bool:
+        if args.fault_trigger_once:
+            return not state["triggered"] and call_idx == args.fault_call_idx
+        return call_idx >= args.fault_call_idx
+
     def hook_fn(_module, _inputs, output):
-        if args.fault_trigger_once and state["triggered"]:
-            return output
         if not phase_matches():
             return output
 
         call_idx = state["matched_calls"]
         state["matched_calls"] += 1
-        if call_idx != args.fault_call_idx:
+        if not should_inject(call_idx):
             return output
 
         tensor, rebuild = normalize_output(output)
@@ -528,15 +531,18 @@ def install_target_tap_fault(
             return True
         return getattr(target_wrapped, "current_phase", "idle") == phase_filter
 
+    def should_inject(call_idx: int) -> bool:
+        if args.fault_trigger_once:
+            return not state["triggered"] and call_idx == args.fault_call_idx
+        return call_idx >= args.fault_call_idx
+
     def hook_fn(_module, _inputs, output):
-        if args.fault_trigger_once and state["triggered"]:
-            return output
         if not phase_matches():
             return output
 
         call_idx = state["matched_calls"]
         state["matched_calls"] += 1
-        if call_idx != args.fault_call_idx:
+        if not should_inject(call_idx):
             return output
 
         tensor, _ = normalize_output(output)
@@ -954,6 +960,7 @@ def main() -> None:
                 fault.cleanup()
 
             if fault.live_metadata:
+                fault.live_metadata["num_fault_sites"] = len(fault.live_metadata.get("fault_sites", []))
                 fault.log["runtime"] = fault.live_metadata
             trial["trial_idx"] = trial_idx
             trial["fault_log"] = fault.log
@@ -971,7 +978,8 @@ def main() -> None:
                 f"mode={fault.log.get('fault_mode')} "
                 f"accept={trial['metrics'].get('acceptance_rate', 0.0):.4f} "
                 f"stop={trial.get('completion_diagnostics', {}).get('stop_reason', 'unknown')} "
-                f"triggered={fault.log.get('runtime', {}).get('triggered', 'weight')}"
+                f"triggered={fault.log.get('runtime', {}).get('triggered', 'weight')} "
+                f"sites={fault.log.get('runtime', {}).get('num_fault_sites', 'weight')}"
             )
 
     aggregate = aggregate_results(baselines, trials)
