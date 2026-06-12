@@ -736,6 +736,21 @@ def run_decode(
     return entry
 
 
+def is_completed_answer(entry: Dict[str, Any], require_correct: bool) -> bool:
+    if entry.get("execution_status") != "success":
+        return False
+    diagnostics = entry.get("completion_diagnostics") or {}
+    if diagnostics.get("stop_reason") != "eos":
+        return False
+    if diagnostics.get("has_think_open") and not diagnostics.get("has_think_close"):
+        return False
+    if entry.get("source") in {"gsm8k", "tinygsm8k"} and not diagnostics.get("has_final_marker"):
+        return False
+    if require_correct and entry.get("reference") and not entry.get("is_correct"):
+        return False
+    return True
+
+
 def build_decoder(args: argparse.Namespace) -> Tuple[Any, Any, Any, TargetModelWithTaps, Any]:
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     print(f"Loading target : {args.base_model_id}")
@@ -859,7 +874,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base_model_id", default="Qwen/Qwen3-8B")
     parser.add_argument("--draft_model_id", default="RedHatAI/Qwen3-8B-Thinking-speculator.eagle3")
     parser.add_argument("--block_size", type=int, default=3)
-    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--max_new_tokens", type=int, default=4096, help="Safety cap; completed runs should stop by EOS.")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top_k", type=int, default=10)
     parser.add_argument("--top_p", type=float, default=0.9)
@@ -878,6 +893,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exclude_sample_ids", default=None, help="Comma-separated dataset sample ids to skip.")
     parser.add_argument("--max_question_chars", type=int, default=None, help="Keep only short questions for quick pilots.")
     parser.add_argument("--prompt", default="What is 25 * 48?")
+    parser.add_argument("--require_completed_baseline", action="store_true", default=True)
+    parser.add_argument("--no_require_completed_baseline", dest="require_completed_baseline", action="store_false")
+    parser.add_argument("--require_correct_baseline", action="store_true", default=True)
+    parser.add_argument("--no_require_correct_baseline", dest="require_correct_baseline", action="store_false")
 
     parser.add_argument("--tree_depth", type=int, default=6)
     parser.add_argument("--tree_branch_factor", type=int, default=4)
@@ -927,6 +946,8 @@ def main() -> None:
     samples = load_samples(args)
 
     baselines: List[Dict[str, Any]] = []
+    runnable_samples: List[Dict[str, Any]] = []
+    skipped_samples: List[Dict[str, Any]] = []
     trials: List[Dict[str, Any]] = []
 
     print(f"Running {len(samples)} baseline sample(s).")
@@ -935,6 +956,19 @@ def main() -> None:
         run_seed = args.seed + sample_id
         baseline = run_decode(decoder, tokenizer, sample, args, run_seed=run_seed)
         baselines.append(baseline)
+        baseline_complete = is_completed_answer(baseline, args.require_correct_baseline)
+        if args.require_completed_baseline and not baseline_complete:
+            skipped_samples.append({
+                "sample_id": sample_id,
+                "reason": "baseline_not_completed_or_not_correct",
+                "execution_status": baseline.get("execution_status"),
+                "is_correct": baseline.get("is_correct"),
+                "completion_diagnostics": baseline.get("completion_diagnostics"),
+                "extracted_answer": baseline.get("extracted_answer"),
+                "reference": baseline.get("reference"),
+            })
+        else:
+            runnable_samples.append(sample)
         baseline_path = os.path.join(dirs["baselines"], f"sample_{sample_id}.json")
         write_json(baseline_path, baseline)
         print(
@@ -942,12 +976,16 @@ def main() -> None:
             f"accept={baseline['metrics'].get('acceptance_rate', 0.0):.4f} "
             f"tokens={baseline['metrics'].get('tokens_emitted', 0)} "
             f"stop={baseline.get('completion_diagnostics', {}).get('stop_reason', 'unknown')} "
-            f"final_marker={baseline.get('completion_diagnostics', {}).get('has_final_marker', False)}"
+            f"final_marker={baseline.get('completion_diagnostics', {}).get('has_final_marker', False)} "
+            f"runnable={sample in runnable_samples}"
         )
 
-    print(f"Running {args.num_fault_trials} fault trial(s) per sample.")
+    if skipped_samples:
+        print(f"Skipping {len(skipped_samples)} sample(s) with incomplete/incorrect baseline.")
+
+    print(f"Running {args.num_fault_trials} fault trial(s) per runnable sample.")
     base_fault_seed = args.fault_seed if args.fault_seed is not None else args.seed + 1_000_003
-    for sample in samples:
+    for sample in runnable_samples:
         sample_id = int(sample.get("sample_id", 0))
         run_seed = args.seed + sample_id
         for trial_idx in range(args.num_fault_trials):
@@ -1014,6 +1052,8 @@ def main() -> None:
             "top_p": args.top_p,
             "enable_thinking": args.enable_thinking,
             "prompt_style": args.prompt_style,
+            "require_completed_baseline": args.require_completed_baseline,
+            "require_correct_baseline": args.require_correct_baseline,
             "seed": args.seed,
             "dtype": args.dtype,
         },
@@ -1044,6 +1084,7 @@ def main() -> None:
             "fault_trigger_once": args.fault_trigger_once,
         },
         "aggregate": aggregate,
+        "skipped_samples": skipped_samples,
         "baselines": [compact_entry(item) for item in baselines],
         "trials": [compact_entry(item) for item in trials],
     }
